@@ -86,10 +86,11 @@ ApplicationWindow {
         StackLayout {
             id: pages
             anchors.fill: parent
-            currentIndex: ["/", "/radio", "/settings"].indexOf(root.route)
+            currentIndex: ["/", "/radio", "/media", "/settings"].indexOf(root.route)
 
             Index {}
             Radio {}
+            Media {}
             Settings {}
         }
     }

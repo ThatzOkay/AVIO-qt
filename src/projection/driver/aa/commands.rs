@@ -103,3 +103,20 @@ pub async fn aa_resume(handle: &Arc<AaSessionHandle>) -> Result<(), String> {
     );
     Ok(())
 }
+
+/// Presses and releases one of the phone's media keys (`button_key::MEDIA_PLAY_PAUSE`, `MEDIA_NEXT`
+/// or `MEDIA_PREV`). Media control is key events only, the media channel has no commands.
+pub async fn aa_media_key(handle: &Arc<AaSessionHandle>, key: u32) -> Result<(), String> {
+    let mut reached_session = true;
+    for down in [true, false] {
+        reached_session &= handle
+            .send(SessionCommand::Button {
+                key_codes: vec![key],
+                down,
+                longpress: false,
+            })
+            .await;
+    }
+    println!("[AA media key] key {key} sent, reached a live session: {reached_session}");
+    Ok(())
+}

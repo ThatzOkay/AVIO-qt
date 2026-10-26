@@ -31,6 +31,14 @@ Pane {
             icon.source: "../../assets/icons/radio.png"
         }
         NavButton {
+            path: "/media"
+            visible: StatusStore.mediaAvailable
+            tinted: true
+            active: bar.route === path
+            onClicked: bar.navigate(path)
+            icon.source: "../../assets/icons/media.png"
+        }
+        NavButton {
             path: "/settings"
             tinted: true
             active: bar.route === path

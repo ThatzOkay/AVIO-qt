@@ -6,8 +6,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
 use super::Remote;
-use crate::projection::driver::aa::commands::{aa_resume, aa_send_touch};
+use crate::projection::driver::aa::commands::{aa_media_key, aa_resume, aa_send_touch};
 use crate::projection::driver::aa::session_handle;
+use crate::projection::driver::aa::stack::channels::input_channel::button_key;
 use crate::projection::driver::aa::stack::channels::media_info_channel::{MediaPlaybackMetadata, MediaPlaybackState, MediaPlaybackStatus};
 use crate::runtime;
 
@@ -41,16 +42,22 @@ pub struct StatusStore {
     fingers: Vec<Finger>,
 }
 
-// Where the current media comes from. Only Android Auto reports any so far
+// Where the current media comes from; no origin means nothing is playing. Only Android Auto
+// reports any so far.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub enum MediaOrigin {
     AndroidAuto,
+    Bluetooth,
+    Usb,
 }
 
 impl MediaOrigin {
     fn as_str(self) -> &'static str {
         match self {
             Self::AndroidAuto => "android-auto",
+            Self::Bluetooth => "bluetooth",
+            Self::Usb => "usb",
         }
     }
 }
@@ -77,8 +84,10 @@ impl StatusStore {
     qproperty!("radioAvailable", Read = radio_available, Notify = radio_hardware_changed);
     qproperty!("aaStatus", Read = aa_status, Notify = aa_changed);
     qproperty!("aaDeviceName", Read = aa_device_name, Notify = aa_changed);
-    // "" when nothing is playing, else "android-auto"
+    // "" when nothing is playing, else "android-auto", "bluetooth" or "usb"
     qproperty!("mediaOrigin", Read = media_origin, Notify = media_changed);
+    // Whether any source is providing media, i.e. whether the media page has something to show
+    qproperty!("mediaAvailable", Read = media_available, Notify = media_changed);
     // "unknown", "stopped", "playing" or "paused"
     qproperty!("mediaState", Read = media_state, Notify = media_changed);
     qproperty!("mediaSource", Read = media_source, Notify = media_changed);
@@ -123,6 +132,10 @@ impl StatusStore {
 
     pub fn aa_device_name(&self) -> String {
         self.aa_device_name.clone()
+    }
+
+    pub fn media_available(&self) -> bool {
+        self.media_origin.is_some()
     }
 
     pub fn media_origin(&self) -> String {
@@ -267,6 +280,21 @@ impl StatusStore {
         });
     }
 
+    #[qslot]
+    fn media_play_pause(&self) {
+        send_media_key(button_key::MEDIA_PLAY_PAUSE);
+    }
+
+    #[qslot]
+    fn media_next(&self) {
+        send_media_key(button_key::MEDIA_NEXT);
+    }
+
+    #[qslot]
+    fn media_previous(&self) {
+        send_media_key(button_key::MEDIA_PREV);
+    }
+
     fn send_touch(&self, phase: &'static str, action_index: usize) {
         let touches = self.fingers.iter().map(|f| (f.x, f.y, f.aa_id)).collect();
         runtime::spawn(async move {
@@ -297,7 +325,8 @@ impl StatusStore {
         match serde_json::from_str(&status) {
             Ok(status) => {
                 self.media_origin = Some(MediaOrigin::AndroidAuto);
-                self.media_status = status;
+                // Updates are partial (a position-only one is common), so merge, don't replace
+                self.media_status.merge(status);
             }
             Err(e) => return eprintln!("aa media status: {e}"),
         }
@@ -315,6 +344,14 @@ impl StatusStore {
         }
         self.media_changed();
     }
+}
+
+fn send_media_key(key: u32) {
+    runtime::spawn(async move {
+        if let Err(e) = aa_media_key(&session_handle::shared(), key).await {
+            eprintln!("aa media key: {e}");
+        }
+    });
 }
 
 // Safe from any thread. Dropped if QML hasn't called StatusStore.init() yet.
