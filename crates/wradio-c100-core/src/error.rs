@@ -38,6 +38,11 @@ pub enum Error {
     #[error("frequency {khz} kHz is not a supported Band III DAB channel")]
     UnsupportedFrequency { khz: u32 },
 
+    /// A tune never reached OFDM + FEC lock within its retry budget: nothing receivable on that
+    /// channel (no antenna, out of range, wrong frequency).
+    #[error("no signal: could not lock onto {khz} kHz")]
+    NoLock { khz: u32 },
+
     /// Reading or writing the persisted station database / presets file
     /// failed.
     #[error("station store I/O error: {0}")]

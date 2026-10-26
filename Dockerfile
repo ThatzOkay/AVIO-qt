@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         qml6-module-qtquick qml6-module-qtquick-controls \
         qml6-module-qtquick-layouts qml6-module-qtquick-templates \
         qml6-module-qtquick-window \
+        qml6-module-qtquick-dialogs qml6-module-qt-labs-folderlistmodel \
     && rm -rf /var/lib/apt/lists/*
 
 # Native libs the path crates link against (cpal, gst-video, rtl-sdr, welle-io-sys,

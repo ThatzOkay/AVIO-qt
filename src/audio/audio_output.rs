@@ -156,6 +156,14 @@ impl AudioOutput {
         }
     }
 
+    /// Whether the gst-launch process is still alive (it exits if its pipeline fails, e.g. on a
+    /// missing element).
+    pub fn is_running(&mut self) -> bool {
+        self.process
+            .as_mut()
+            .is_some_and(|process| matches!(process.try_wait(), Ok(None)))
+    }
+
     pub async fn stop(&mut self) {
         if self.process.is_none() {
             return;

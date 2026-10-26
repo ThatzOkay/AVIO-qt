@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Controls.Material
 import avio_qt
 import "../Settings"
 
@@ -11,12 +12,20 @@ ColumnLayout {
     readonly property bool running: dab.running ?? false
     readonly property bool playing: dab.playing ?? false
     readonly property bool scanning: dab.scanning ?? false
+    // The station being tuned, while a tune is still going (it retries until it plays or is stopped)
+    readonly property var tuning: dab.tuning ?? null
+    // Playing was accepted, but no audio has reached the output yet
+    readonly property bool buffering: playing && !(dab.audioReady ?? false) && !(dab.audioError ?? "")
+    readonly property string audioError: dab.audioError ?? ""
+    readonly property var signalBars: dab.signalBars ?? null
     readonly property var stations: dab.stations ?? []
     readonly property var current: dab.current ?? null
     readonly property var favorites: dab.favorites ?? []
-    readonly property string error: RadioStore.state?.error ?? ""
+    readonly property string error: (RadioStore.state?.error ?? "") || audioError
     readonly property string statusText: error ? error
         : scanning ? (RadioStore.scanText || "Scanning…")
+        : tuning ? (dab.tuningStatus || ("Tuning " + tuning.label + "…"))
+        : buffering ? "Tuning…"
         : playing ? "Playing"
         : running ? "Ready" : "Stopped"
 
@@ -50,11 +59,27 @@ ColumnLayout {
             color: Theme.onSurfaceVariant
             font.pixelSize: 16
         }
-        Label {
+        RowLayout {
             Layout.alignment: Qt.AlignHCenter
-            text: root.statusText
-            color: root.error ? Theme.error : Theme.onSurfaceVariant
-            font.pixelSize: 14
+            spacing: 8
+
+            BusyIndicator {
+                Layout.preferredWidth: 20
+                Layout.preferredHeight: 20
+                running: visible
+                visible: root.buffering || root.busy || root.scanning || root.tuning !== null
+                Material.accent: Theme.primary
+            }
+            Label {
+                text: root.statusText
+                color: root.error ? Theme.error : Theme.onSurfaceVariant
+                font.pixelSize: 14
+            }
+            SignalBars {
+                Layout.alignment: Qt.AlignVCenter
+                visible: root.signalBars !== null
+                bars: root.signalBars ?? 0
+            }
         }
     }
 
@@ -80,8 +105,9 @@ ColumnLayout {
             delegate: Item {
                 id: cell
                 required property var modelData
-                readonly property bool active: root.playing && root.current?.id === modelData.id
-                    && root.current?.frequency === modelData.frequency
+                readonly property bool active: (root.playing && root.current?.id === modelData.id
+                    && root.current?.frequency === modelData.frequency)
+                    || (root.tuning?.id === modelData.id && root.tuning?.frequency === modelData.frequency)
 
                 width: grid.cellWidth
                 height: grid.cellHeight
@@ -154,8 +180,8 @@ ColumnLayout {
         CircleButton {
             diameter: 76
             primary: true
-            iconSource: root.playing ? "../../../assets/icons/mdi/stop.png" : "../../../assets/icons/mdi/play.png"
-            enabled: !root.busy && root.running && !root.scanning && (root.playing || root.current !== null)
+            iconSource: root.playing || root.tuning ? "../../../assets/icons/mdi/stop.png" : "../../../assets/icons/mdi/play.png"
+            enabled: !root.busy && root.running && !root.scanning && (root.playing || root.tuning !== null || root.current !== null)
             onClicked: RadioStore.dab_toggle_play()
         }
     }

@@ -30,6 +30,11 @@ Item {
             icon: "../../assets/icons/mdi/car.png"
         },
         {
+            id: "radio",
+            label: "Radio",
+            icon: "../../assets/icons/mdi/radio.png"
+        },
+        {
             id: "updates",
             label: "Updates",
             icon: "../../assets/icons/mdi/update.png"
@@ -46,6 +51,7 @@ Item {
         "sound": "../Components/Settings/Sound.qml",
         "display": "../Components/Settings/Display.qml",
         "android-auto": "../Components/Settings/AndroidAuto.qml",
+        "radio": "../Components/Settings/DabStations.qml",
         "updates": "../Components/Settings/Updates.qml",
         "about": "../Components/Settings/About.qml"
     }

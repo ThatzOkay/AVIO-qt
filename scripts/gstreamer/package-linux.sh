@@ -311,7 +311,8 @@ plugins=(
   libgstvideoparsersbad.so
   libgstvideoconvertscale.so
   libgstopengl.so
-  libgstlibav.so
+  # no libgstlibav: it drags in all of ffmpeg (~180MB). faad decodes the DAB+ AAC, and video
+  # decodes in hardware (v4l2/va) - see src/audio/gstreamer.rs
 )
 
 for plugin in "${plugins[@]}"; do

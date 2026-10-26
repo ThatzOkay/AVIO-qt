@@ -411,9 +411,17 @@ impl TaskState {
     async fn do_tune(&mut self, frequency_khz: u32, out: &Outputs) -> crate::Result<()> {
         self.scanning = false;
         self.stop_service().await?;
-        self.tuner
-            .tune_and_wait_for_lock(frequency_khz, std::time::Duration::from_secs(4), 3)
+        // `Ok(false)` means the retry budget ran out without a lock; treating that as success
+        // would leave the caller waiting on an ensemble that can never fill in. One attempt
+        // only: the device task can't take other commands while it waits, so a caller that
+        // wants to keep trying (and stay cancellable) retries by sending `Tune` again.
+        let locked = self
+            .tuner
+            .tune_and_wait_for_lock(frequency_khz, std::time::Duration::from_secs(4), 1)
             .await?;
+        if !locked {
+            return Err(crate::Error::NoLock { khz: frequency_khz });
+        }
         self.ensemble = Ensemble::new();
         self.ensemble.set_frequency_khz(frequency_khz);
         self.tuned = true;

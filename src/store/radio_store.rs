@@ -99,6 +99,16 @@ impl RadioStore {
     }
 
     #[qslot]
+    fn dab_export_list(&self, folder: String) {
+        radio::send(Command::DabExportList(folder.into()));
+    }
+
+    #[qslot]
+    fn dab_import_list(&self, file: String) {
+        radio::send(Command::DabImportList(file.into()));
+    }
+
+    #[qslot]
     fn state_set(&mut self, state: Value) {
         self.state = state;
         self.state_changed();

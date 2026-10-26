@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +18,29 @@ use super::dab::{DabScanProgress, DabStation};
 // antenna; this only guards against a scan that never reports finishing.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(300);
 const SCAN_START_TIMEOUT: Duration = Duration::from_secs(5);
+// After a tune the ensemble starts empty and fills in as the FIC is polled, which takes a few
+// seconds; a service can only be started once it's listed.
+const SERVICE_LIST_TIMEOUT: Duration = Duration::from_secs(15);
+const AUDIO_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether decoded audio is actually reaching the output, as opposed to a tune having been asked for.
+#[derive(Default)]
+struct AudioState {
+    /// Frames have been written into an output that is still alive.
+    ready: AtomicBool,
+    /// Set when the output process died, e.g. its pipeline failed.
+    error: Mutex<Option<String>>,
+    /// When the current station started, until its first audio frame shows up (for the log)
+    waiting_since: Mutex<Option<std::time::Instant>>,
+}
+
+impl AudioState {
+    fn reset(&self) {
+        self.ready.store(false, Ordering::SeqCst);
+        *self.error.lock().unwrap() = None;
+        *self.waiting_since.lock().unwrap() = None;
+    }
+}
 
 /// Drives the WRadio C100 (a generic Android USB DAB+ stick) through `wradio-c100-core`. Audio
 /// leaves the core as raw DAB+ access units; they are ADTS-framed here and piped into GStreamer.
@@ -25,6 +49,9 @@ pub struct WradioBackend {
     device: Option<DeviceHandle>,
     audio: Option<Arc<tokio::sync::Mutex<AudioOutput>>>,
     dynamic_label: Arc<Mutex<Option<String>>>,
+    audio_state: Arc<AudioState>,
+    // Why the running tune is still retrying, for the UI
+    tune_status: Arc<Mutex<Option<String>>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -35,6 +62,8 @@ impl WradioBackend {
             device: None,
             audio: None,
             dynamic_label: Arc::new(Mutex::new(None)),
+            audio_state: Arc::new(AudioState::default()),
+            tune_status: Arc::new(Mutex::new(None)),
             tasks: Vec::new(),
         }
     }
@@ -61,18 +90,69 @@ impl WradioBackend {
             .map_err(|e| e.to_string())
     }
 
+    fn report_audio(state: &AudioState, notify: &Notifier, alive: bool) {
+        if alive {
+            if !state.ready.swap(true, Ordering::SeqCst) {
+                let _ = notify.send(());
+            }
+            return;
+        }
+        let mut error = state.error.lock().unwrap();
+        if error.is_none() {
+            *error = Some("Audio output stopped, see the log".to_string());
+            state.ready.store(false, Ordering::SeqCst);
+            let _ = notify.send(());
+        }
+    }
+
     /// ADTS-frames each access unit of `frame` and writes it to the audio output.
     async fn forward_audio(
         mut rx: broadcast::Receiver<AudioFrame>,
         audio: Arc<tokio::sync::Mutex<AudioOutput>>,
+        state: Arc<AudioState>,
+        notify: Notifier,
     ) {
         let mut adts_buf = Vec::new();
+        // A summary line every few seconds instead of one per frame (~8 a second)
+        let mut report = tokio::time::interval(AUDIO_REPORT_INTERVAL);
+        report.tick().await;
+        let (mut frames, mut bytes, mut dropped) = (0u32, 0usize, 0u32);
+        let mut had_frames = false;
+        let mut last_format = String::new();
         loop {
-            let frame = match rx.recv().await {
-                Ok(frame) => frame,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+            let frame = tokio::select! {
+                frame = rx.recv() => match frame {
+                    Ok(frame) => frame,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = report.tick() => {
+                    if frames > 0 {
+                        eprintln!("[DAB] audio: {frames} frames, {bytes} bytes in {AUDIO_REPORT_INTERVAL:?} ({last_format}){}",
+                            if dropped > 0 { format!(", {dropped} dropped (unusable sample rate)") } else { String::new() });
+                        had_frames = true;
+                    } else if let Some(since) = *state.waiting_since.lock().unwrap() {
+                        eprintln!("[DAB] audio: no frames yet, {:?} after the station started", since.elapsed());
+                    } else if had_frames {
+                        eprintln!("[DAB] audio: frames stopped");
+                        had_frames = false;
+                    }
+                    (frames, bytes, dropped) = (0, 0, 0);
+                    continue;
+                }
             };
+
+            last_format = format!(
+                "{} Hz, {} ch, sbr {}, ps {}, {} AUs",
+                frame.sample_rate,
+                frame.channels,
+                frame.sbr_used,
+                frame.ps_used,
+                frame.access_unit_lengths.len()
+            );
+            if let Some(since) = state.waiting_since.lock().unwrap().take() {
+                eprintln!("[DAB] first audio frame {:?} after the station started: {last_format}", since.elapsed());
+            }
 
             // `sample_rate` is the post-SBR output rate; the ADTS header needs the AAC core's.
             let core_rate = if frame.sbr_used {
@@ -81,6 +161,7 @@ impl WradioBackend {
                 frame.sample_rate
             };
             let Some(freq_idx) = adts::sampling_frequency_index(core_rate) else {
+                dropped += 1;
                 continue;
             };
 
@@ -95,8 +176,15 @@ impl WradioBackend {
                 adts_buf.extend_from_slice(au);
                 pos += len;
             }
+            frames += 1;
+            bytes += adts_buf.len();
 
-            audio.lock().await.write_bytes(adts_buf.clone()).await;
+            let alive = {
+                let mut output = audio.lock().await;
+                output.write_bytes(adts_buf.clone()).await;
+                output.is_running()
+            };
+            Self::report_audio(&state, &notify, alive);
         }
     }
 
@@ -144,6 +232,8 @@ impl WradioBackend {
         self.tasks.push(tokio::spawn(Self::forward_audio(
             device.subscribe_audio(),
             audio.clone(),
+            self.audio_state.clone(),
+            self.notify.clone(),
         )));
 
         let mut dls_rx = device.subscribe_dls_update();
@@ -155,6 +245,26 @@ impl WradioBackend {
                     Ok(event) => {
                         let text = event.update.text.trim().to_string();
                         Self::set_label(&notify, &label, (!text.is_empty()).then_some(text));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+
+        // The core refreshes this on every poll; only wake the UI when the bars actually move
+        let mut lock_rx = device.subscribe_lock_status();
+        let notify = self.notify.clone();
+        self.tasks.push(tokio::spawn(async move {
+            let mut last = None;
+            loop {
+                match lock_rx.recv().await {
+                    Ok(quality) => {
+                        let shown = (quality.locked, quality.signal_bars);
+                        if last != Some(shown) {
+                            last = Some(shown);
+                            let _ = notify.send(());
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -178,6 +288,7 @@ impl WradioBackend {
         if let Some(audio) = self.audio.take() {
             audio.lock().await.stop().await;
         }
+        self.audio_state.reset();
         Self::set_label(&self.notify, &self.dynamic_label, None);
         Ok(())
     }
@@ -253,29 +364,22 @@ impl WradioBackend {
         Ok(stations)
     }
 
-    pub async fn tune(&mut self, station: &DabStation) -> Result<(), String> {
-        let device = self.device()?.clone();
-
-        Self::set_label(&self.notify, &self.dynamic_label, None);
-
-        // Switching between services of the ensemble already tuned doesn't need a re-tune.
-        let already_tuned = device
-            .snapshot()
-            .ensemble
-            .is_some_and(|e| e.frequency_khz == station.frequency);
-        if !already_tuned {
-            Self::send_and_wait(&device, |done| Command::Tune {
-                frequency_khz: station.frequency,
-                done: Some(done),
-            })
-            .await?;
-        }
-
-        Self::send_and_wait(&device, |done| Command::StartService {
-            service_id: station.id,
-            done: Some(done),
+    /// Everything a tune needs, owned, so it can run while the backend itself stays free (and be
+    /// dropped to cancel it).
+    pub fn tune_job(&self) -> Result<TuneJob, String> {
+        *self.tune_status.lock().unwrap() = None;
+        Ok(TuneJob {
+            notify: self.notify.clone(),
+            device: self.device()?.clone(),
+            audio: self.audio.clone(),
+            dynamic_label: self.dynamic_label.clone(),
+            audio_state: self.audio_state.clone(),
+            status: self.tune_status.clone(),
         })
-        .await
+    }
+
+    pub fn tune_status(&self) -> Option<String> {
+        self.tune_status.lock().unwrap().clone()
     }
 
     pub async fn stop_playback(&mut self) -> Result<(), String> {
@@ -283,11 +387,156 @@ impl WradioBackend {
             .send(Command::StopService)
             .await
             .map_err(|e| e.to_string())?;
+        self.audio_state.reset();
         Self::set_label(&self.notify, &self.dynamic_label, None);
         Ok(())
     }
 
+    /// Signal bars (0..=6) of the tuned ensemble, if the device has reported any.
+    pub fn signal_bars(&self) -> Option<u8> {
+        self.device.as_ref()?.snapshot().lock_status?.signal_bars
+    }
+
+    pub fn audio_ready(&self) -> bool {
+        self.audio_state.ready.load(Ordering::SeqCst)
+    }
+
+    pub fn audio_error(&self) -> Option<String> {
+        self.audio_state.error.lock().unwrap().clone()
+    }
+
     pub fn dynamic_label(&self) -> Option<String> {
         self.dynamic_label.lock().unwrap().clone()
+    }
+}
+
+/// One station tune. `run` keeps retrying until the station plays; dropping the future (the user
+/// stopped, or picked another station) is how it's cancelled, so every wait in it is an await.
+pub struct TuneJob {
+    notify: Notifier,
+    device: DeviceHandle,
+    audio: Option<Arc<tokio::sync::Mutex<AudioOutput>>>,
+    dynamic_label: Arc<Mutex<Option<String>>>,
+    audio_state: Arc<AudioState>,
+    status: Arc<Mutex<Option<String>>>,
+}
+
+/// Why a tune attempt didn't get the station playing.
+enum Attempt {
+    /// Might work next time (no lock, station list never arrived).
+    Retry(String),
+    Fatal(String),
+}
+
+impl TuneJob {
+    fn set_status(&self, status: Option<String>) {
+        *self.status.lock().unwrap() = status;
+        let _ = self.notify.send(());
+    }
+
+    pub async fn run(&self, station: &DabStation) -> Result<(), String> {
+        self.audio_state.reset();
+        WradioBackend::set_label(&self.notify, &self.dynamic_label, None);
+        // The output exits if its pipeline failed; bring it back before new audio arrives
+        if let Some(audio) = &self.audio {
+            let mut output = audio.lock().await;
+            if !output.is_running() {
+                output.start().await;
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let mut force_retune = false;
+        loop {
+            attempt += 1;
+            match self.attempt(station, force_retune, started).await {
+                Ok(()) => {
+                    self.set_status(None);
+                    *self.audio_state.waiting_since.lock().unwrap() = Some(std::time::Instant::now());
+                    return Ok(());
+                }
+                Err(Attempt::Retry(why)) => {
+                    eprintln!("[DAB] {why} (attempt {attempt}), retrying");
+                    self.set_status(Some(format!("{why}, retrying ({attempt})")));
+                    // A station list that never arrived needs a fresh tune, not the same one
+                    force_retune = true;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(Attempt::Fatal(error)) => {
+                    self.set_status(None);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn attempt(
+        &self,
+        station: &DabStation,
+        force_retune: bool,
+        started: std::time::Instant,
+    ) -> Result<(), Attempt> {
+        let channel = channel_name(station.frequency).unwrap_or("?");
+
+        // Switching between services of the ensemble already tuned doesn't need a re-tune.
+        let already_tuned = !force_retune
+            && self
+                .device
+                .snapshot()
+                .ensemble
+                .is_some_and(|e| e.frequency_khz == station.frequency);
+        eprintln!(
+            "[DAB] tuning {} on {channel} ({} kHz){}",
+            station.label,
+            station.frequency,
+            if already_tuned { ", ensemble already tuned" } else { "" }
+        );
+        if !already_tuned {
+            self.tune_device(station.frequency).await.map_err(|error| match error {
+                wradio_c100_core::Error::NoLock { .. } => Attempt::Retry(format!("No signal on {channel}")),
+                other => Attempt::Fatal(other.to_string()),
+            })?;
+            eprintln!("[DAB] tuned after {:?}", started.elapsed());
+        }
+
+        // StartService is a silent no-op for a service the ensemble doesn't list yet, which is
+        // the case right after a tune, so wait for the FIC to list it first.
+        let mut snapshots = self.device.watch_snapshot();
+        let listed = snapshots.wait_for(|snapshot| {
+            snapshot.ensemble.as_ref().is_some_and(|e| {
+                e.frequency_khz == station.frequency
+                    && e.services.iter().any(|s| s.service_id == station.id && s.has_dab_plus_audio)
+            })
+        });
+        match tokio::time::timeout(SERVICE_LIST_TIMEOUT, listed).await {
+            Ok(Ok(_)) => eprintln!("[DAB] {} listed after {:?}", station.label, started.elapsed()),
+            Ok(Err(_)) => return Err(Attempt::Fatal("DAB device task stopped".into())),
+            Err(_) => return Err(Attempt::Retry(format!("Waiting for {channel}'s station list"))),
+        }
+
+        WradioBackend::send_and_wait(&self.device, |done| Command::StartService {
+            service_id: station.id,
+            done: Some(done),
+        })
+        .await
+        .map_err(Attempt::Fatal)?;
+        if self.device.snapshot().current_service_id != Some(station.id) {
+            return Err(Attempt::Fatal(format!("{} could not be started", station.label)));
+        }
+        eprintln!("[DAB] {} started after {:?}", station.label, started.elapsed());
+        Ok(())
+    }
+
+    /// `Command::Tune` with its error kept typed, so a missing lock can be told from the rest.
+    async fn tune_device(&self, frequency_khz: u32) -> wradio_c100_core::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.device
+            .send(Command::Tune {
+                frequency_khz,
+                done: Some(tx),
+            })
+            .await?;
+        rx.await.map_err(|_| wradio_c100_core::Error::DeviceDisconnected)?
     }
 }

@@ -1,10 +1,12 @@
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::store::{radio_store, settings_store};
-use dab::DabTuner;
+use dab::{DabStation, DabTuner};
 use fm::FmTuner;
 
 pub mod channels;
@@ -55,6 +57,45 @@ pub enum Command {
     DabTune { id: u32, frequency: u32 },
     DabSetFavorite(usize),
     DabRecallFavorite(usize),
+    // Writes the station list into this folder / replaces it with the list in this file
+    DabExportList(PathBuf),
+    DabImportList(PathBuf),
+}
+
+impl Command {
+    /// Whether this should cancel a tune that's still retrying: the user stopped, picked another
+    /// station or went elsewhere.
+    fn interrupts_tune(&self) -> bool {
+        matches!(
+            self,
+            Self::DabTune { .. }
+                | Self::DabTogglePlay
+                | Self::DabRecallFavorite(_)
+                | Self::DabScan
+                | Self::Deactivate
+                | Self::Activate(Mode::Fm)
+        )
+    }
+
+    /// Whether this can be served right away while a tune is retrying, without touching it.
+    fn runs_during_tune(&self) -> bool {
+        matches!(
+            self,
+            Self::Refresh
+                | Self::Activate(Mode::Dab)
+                | Self::DabSetFavorite(_)
+                | Self::DabExportList(_)
+                | Self::DabImportList(_)
+        )
+    }
+}
+
+// What the service listens on besides the command it's running
+struct Io {
+    commands: mpsc::UnboundedReceiver<Command>,
+    changes: mpsc::UnboundedReceiver<()>,
+    // Commands that arrived during a tune and have to wait their turn
+    backlog: VecDeque<Command>,
 }
 
 static COMMANDS: OnceLock<mpsc::UnboundedSender<Command>> = OnceLock::new();
@@ -77,21 +118,32 @@ pub fn start() {
     crate::runtime::spawn(run(rx));
 }
 
-async fn run(mut commands: mpsc::UnboundedReceiver<Command>) {
-    let (notify, mut changes) = mpsc::unbounded_channel();
+async fn run(commands: mpsc::UnboundedReceiver<Command>) {
+    let (notify, changes) = mpsc::unbounded_channel();
     let mut service = RadioService::new(notify, &settings_store::snapshot());
+    let mut io = Io { commands, changes, backlog: VecDeque::new() };
+    // A command that cancelled a tune, to run next
+    let mut interrupt = None;
 
     loop {
-        tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else { break };
-                service.busy = true;
-                service.publish();
-                service.handle(command).await;
-                service.busy = false;
-            }
-            Some(()) = changes.recv() => while changes.try_recv().is_ok() {},
-        }
+        let command = match io.backlog.pop_front().or_else(|| interrupt.take()) {
+            Some(command) => command,
+            None => tokio::select! {
+                command = io.commands.recv() => match command {
+                    Some(command) => command,
+                    None => break,
+                },
+                Some(()) = io.changes.recv() => {
+                    while io.changes.try_recv().is_ok() {}
+                    service.publish();
+                    continue;
+                }
+            },
+        };
+        service.busy = true;
+        service.publish();
+        interrupt = service.handle(command, &mut io).await;
+        service.busy = false;
         service.publish();
     }
 
@@ -105,6 +157,8 @@ struct RadioService {
     busy: bool,
     scanning: bool,
     error: Option<String>,
+    // What the last export/import did, for the settings page
+    notice: Option<String>,
     fm: FmTuner,
     dab: DabTuner,
 }
@@ -117,6 +171,7 @@ impl RadioService {
             busy: false,
             scanning: false,
             error: None,
+            notice: None,
             fm: FmTuner::new(notify.clone(), saved.fm_frequency, &saved.fm_favorites),
             dab: DabTuner::new(
                 notify,
@@ -127,11 +182,14 @@ impl RadioService {
         }
     }
 
-    async fn handle(&mut self, command: Command) {
+    // Returns the command that cancelled a tune started by this one, if any
+    async fn handle(&mut self, command: Command, io: &mut Io) -> Option<Command> {
         self.error = None;
+        self.notice = None;
+        let mut interrupt = None;
         let result = match command {
             Command::Refresh => Ok(()),
-            Command::Activate(mode) => self.activate(mode).await,
+            Command::Activate(mode) => self.activate(mode, io, &mut interrupt).await,
             Command::Deactivate => {
                 self.release().await;
                 Ok(())
@@ -144,22 +202,33 @@ impl RadioService {
             Command::FmSetFavorite(slot) => self.fm.set_favorite(slot),
             Command::FmRecallFavorite(slot) => self.fm.recall_favorite(slot).await,
             Command::DabScan => self.dab_scan().await,
-            Command::DabTogglePlay => self.dab_toggle_play().await,
+            Command::DabTogglePlay => self.dab_toggle_play(io, &mut interrupt).await,
             Command::DabTune { id, frequency } => match self.dab.find(id, frequency) {
-                Some(station) => self.dab.tune(station).await,
+                Some(station) => self.dab_tune(station, io, &mut interrupt).await,
                 None => Err("Unknown DAB station".into()),
             },
             Command::DabSetFavorite(slot) => self.dab.set_favorite(slot),
-            Command::DabRecallFavorite(slot) => self.dab.recall_favorite(slot).await,
+            Command::DabRecallFavorite(slot) => match self.dab.favorite(slot) {
+                Ok(station) => self.dab_tune(station, io, &mut interrupt).await,
+                Err(e) => Err(e),
+            },
+            Command::DabExportList(folder) => self.dab.export_list(&folder).await.map(|notice| self.notice = Some(notice)),
+            Command::DabImportList(file) => self.dab.import_list(&file).await.map(|notice| self.notice = Some(notice)),
         };
         if let Err(e) = result {
             eprintln!("radio: {e}");
             self.error = Some(e);
         }
         self.persist();
+        interrupt
     }
 
-    async fn activate(&mut self, mode: Mode) -> Result<(), String> {
+    async fn activate(
+        &mut self,
+        mode: Mode,
+        io: &mut Io,
+        interrupt: &mut Option<Command>,
+    ) -> Result<(), String> {
         self.mode = mode;
         self.active = true;
         match mode {
@@ -172,7 +241,14 @@ impl RadioService {
             }
             Mode::Dab => {
                 self.fm.stop().await;
-                self.dab.start(hardware::get()).await
+                // Only when the tuner was just opened (the page was entered), so switching tabs
+                // doesn't restart a station the user stopped
+                let opened = !self.dab.running();
+                self.dab.start(hardware::get()).await?;
+                match self.dab.current().cloned() {
+                    Some(last) if opened && !self.dab.playing() => self.dab_tune(last, io, interrupt).await,
+                    _ => Ok(()),
+                }
             }
         }
     }
@@ -210,11 +286,79 @@ impl RadioService {
         result
     }
 
-    async fn dab_toggle_play(&mut self) -> Result<(), String> {
-        match self.dab.current().cloned() {
-            Some(station) if !self.dab.playing() => self.dab.tune(station).await,
-            _ => self.dab.stop_playback().await,
+    async fn dab_toggle_play(&mut self, io: &mut Io, interrupt: &mut Option<Command>) -> Result<(), String> {
+        // Stop covers a tune that's still retrying too (it was cancelled to get here)
+        if self.dab.playing() || self.dab.tuning().is_some() {
+            return self.dab.stop_playback().await;
         }
+        match self.dab.current().cloned() {
+            Some(station) => self.dab_tune(station, io, interrupt).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Tunes `station`, retrying until it plays. Meanwhile commands keep being served: stopping or
+    /// picking another station drops the tune (and is handed back through `interrupt` to run
+    /// next), the rest either run now or wait in the backlog.
+    async fn dab_tune(
+        &mut self,
+        station: DabStation,
+        io: &mut Io,
+        interrupt: &mut Option<Command>,
+    ) -> Result<(), String> {
+        let job = self.dab.begin_tune(station.clone())?;
+        self.publish();
+
+        let mut tune = Box::pin(job.run(&station));
+        let result = loop {
+            tokio::select! {
+                result = &mut tune => break Some(result),
+                command = io.commands.recv() => match command {
+                    None => break None,
+                    Some(command) if command.interrupts_tune() => {
+                        *interrupt = Some(command);
+                        break None;
+                    }
+                    Some(command) if command.runs_during_tune() => {
+                        self.handle_inline(command).await;
+                        self.publish();
+                    }
+                    Some(command) => io.backlog.push_back(command),
+                },
+                Some(()) = io.changes.recv() => {
+                    while io.changes.try_recv().is_ok() {}
+                    self.publish();
+                }
+            }
+        };
+        drop(tune);
+
+        match result {
+            Some(result) => {
+                self.dab.finish_tune(station, &result);
+                result
+            }
+            // Cancelled: whoever cancelled it deals with `tuning`, which is how a stop knows
+            // there was something to stop
+            None => Ok(()),
+        }
+    }
+
+    /// The commands `Command::runs_during_tune` lets through
+    async fn handle_inline(&mut self, command: Command) {
+        self.error = None;
+        self.notice = None;
+        let result = match command {
+            Command::DabSetFavorite(slot) => self.dab.set_favorite(slot),
+            Command::DabExportList(folder) => self.dab.export_list(&folder).await.map(|notice| self.notice = Some(notice)),
+            Command::DabImportList(file) => self.dab.import_list(&file).await.map(|notice| self.notice = Some(notice)),
+            _ => Ok(()),
+        };
+        if let Err(e) = result {
+            eprintln!("radio: {e}");
+            self.error = Some(e);
+        }
+        self.persist();
     }
 
     fn persist(&self) {
@@ -242,8 +386,10 @@ impl RadioService {
         let station = self.fm.station();
         json!({
             "mode": self.mode.name(),
-            "busy": self.busy,
+            // A tune that's retrying isn't busy: the UI has to stay usable to cancel it
+            "busy": self.busy && self.dab.tuning().is_none(),
             "error": self.error,
+            "notice": self.notice,
             "fm": {
                 "running": self.fm.running(),
                 "frequency": self.fm.frequency(),
@@ -254,6 +400,11 @@ impl RadioService {
             "dab": {
                 "running": self.dab.running(),
                 "playing": self.dab.playing(),
+                "tuning": self.dab.tuning(),
+                "tuningStatus": self.dab.tuning().and_then(|_| self.dab.tune_status()),
+                "signalBars": self.dab.signal_bars(),
+                "audioReady": self.dab.audio_ready(),
+                "audioError": self.dab.audio_error(),
                 "scanning": self.scanning,
                 "stations": self.dab.stations(),
                 "current": self.dab.current(),
