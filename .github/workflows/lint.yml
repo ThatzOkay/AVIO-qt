@@ -11,33 +11,35 @@ jobs:
     name: Clippy (Rust)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Same image as the Dockerfile: ubuntu-latest's Qt 6.4 is too old for qtbridge (needs QSpan)
+    container: debian:forky-slim
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      QMAKE: /usr/lib/qt6/bin/qmake6
 
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-          submodules: recursive
-
-      # Same packages as the Dockerfile's build stage
+      # git is needed before checkout for the welle.io submodule
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential curl pkg-config perl protobuf-compiler \
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates build-essential curl pkg-config perl protobuf-compiler \
             qt6-base-dev qt6-base-private-dev qt6-declarative-dev qt6-declarative-private-dev qt6-base-dev-tools \
             libasound2-dev libpulse-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             librtlsdr-dev libfftw3-dev libbz2-dev
 
-      # qt-build-utils (qtbridge's build script) runs libexec/qtpaths, which Debian/Ubuntu may
-      # leave dangling; only bin/qtpaths6 is reliable.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      # qt-build-utils (qtbridge's build script) runs libexec/qtpaths, which Debian leaves
+      # dangling or missing; only bin/qtpaths6 exists.
       - name: Fix qtpaths
         run: |
-          set -euo pipefail
-          QT_DIR="$(dirname "$(dirname "$(command -v qmake6)")")"
-          sudo mkdir -p "$QT_DIR/libexec"
-          sudo ln -sf "$QT_DIR/bin/qtpaths6" "$QT_DIR/libexec/qtpaths"
-          echo "QMAKE=$(command -v qmake6)" >> "$GITHUB_ENV"
+          mkdir -p /usr/lib/qt6/libexec
+          ln -sf /usr/lib/qt6/bin/qtpaths6 /usr/lib/qt6/libexec/qtpaths
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
