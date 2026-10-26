@@ -19,6 +19,7 @@ use super::stack::constants::ch;
 use super::stack::session::config::{SessionConfig, VideoCodec};
 use super::stack::session::session::{Session, SessionEvent};
 use super::stack::transport::usb_aoap_bridge::{BridgeEvent, UsbAoapBridge};
+use super::video_tier;
 
 /// Matches the rates `Session::handle_av_setup_request` negotiates per channel.
 fn audio_format_for(channel_id: u8) -> (i32, i32) {
@@ -51,12 +52,6 @@ pub async fn connect_wired(phone: nusb::DeviceInfo) {
     let handle = crate::projection::driver::aa::session_handle::shared();
     let current_settings = settings_store::snapshot();
 
-    let (width, height) = match current_settings.ao_resolution.as_str() {
-        "1080p" => (1920, 1080),
-        "720p" => (1280, 720),
-        _ => (1920, 1080),
-    };
-
     let bridge = UsbAoapBridge::new();
     let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
 
@@ -85,16 +80,32 @@ pub async fn connect_wired(phone: nusb::DeviceInfo) {
                 match TcpStream::connect((AOAP_LOOPBACK_HOST, AOAP_LOOPBACK_PORT)).await {
                     Ok(socket) => {
                         let probe = probe_gst_codecs();
-                        let (display_width, display_height) = display_size().unzip();
+                        let screen = display_size();
+                        let (display_width, display_height) = screen.unzip();
+                        let tier = video_tier::resolve(
+                            &current_settings.ao_resolution,
+                            current_settings.ao_dpi_auto,
+                            current_settings.ao_dpi,
+                            screen,
+                        );
+                        println!(
+                            "[AA wired] video {}x{} at {} dpi (resolution {}, dpi {}, screen {:?})",
+                            tier.width,
+                            tier.height,
+                            tier.dpi,
+                            current_settings.ao_resolution,
+                            if current_settings.ao_dpi_auto { "auto" } else { "manual" },
+                            screen,
+                        );
                         let cfg = SessionConfig {
                             hevc_supported: probe.h265.hw || probe.h265.sw,
                             vp9_supported: probe.vp9.hw || probe.vp9.sw,
                             av1_supported: probe.av1.hw || probe.av1.sw,
                             display_width,
                             display_height,
-                            video_width: Some(width),
-                            video_height: Some(height),
-                            video_dpi: Some(current_settings.ao_dpi as u32),
+                            video_width: Some(tier.width),
+                            video_height: Some(tier.height),
+                            video_dpi: Some(tier.dpi),
                             video_fps: current_settings.ao_framerate.parse().ok(),
                             main_view_area_top: Some(current_settings.ao_view_area_top),
                             main_view_area_bottom: Some(current_settings.ao_view_area_bottom),

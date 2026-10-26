@@ -27,6 +27,8 @@ pub struct AppSettings {
     pub ao_resolution: String,
     pub ao_framerate: String,
     pub ao_dpi: f64,
+    // Pick the dpi from the video tier and the screen size (see video_tier), ignoring `ao_dpi`
+    pub ao_dpi_auto: bool,
     pub ao_view_area_top: u32,
     pub ao_view_area_bottom: u32,
     pub ao_view_area_left: u32,
@@ -57,9 +59,10 @@ impl Default for AppSettings {
             brightness: 0,
             dark: false,
             seed: DEFAULT_SEED.to_string(),
-            ao_resolution: "1080p".to_string(),
+            ao_resolution: "auto".to_string(),
             ao_framerate: "60".to_string(),
             ao_dpi: 160.0,
+            ao_dpi_auto: true,
             ao_view_area_top: 0,
             ao_view_area_bottom: 0,
             ao_view_area_left: 0,
@@ -168,6 +171,7 @@ pub struct SettingsStore {
     ao_resolution: String,
     ao_framerate: String,
     ao_dpi: f64,
+    ao_dpi_auto: bool,
     ao_view_area_top: u32,
     ao_view_area_bottom: u32,
     ao_view_area_left: u32,
@@ -194,6 +198,7 @@ impl Default for SettingsStore {
             ao_resolution: saved.ao_resolution,
             ao_framerate: saved.ao_framerate,
             ao_dpi: saved.ao_dpi,
+            ao_dpi_auto: saved.ao_dpi_auto,
             ao_view_area_top: saved.ao_view_area_top,
             ao_view_area_bottom: saved.ao_view_area_bottom,
             ao_view_area_left: saved.ao_view_area_left,
@@ -222,6 +227,7 @@ impl SettingsStore {
     qproperty!("aoResolution", Read = ao_resolution, Write = set_ao_resolution, Notify = ao_resolution_changed);
     qproperty!("aoFramerate", Read = ao_framerate, Write = set_ao_framerate, Notify = ao_framerate_changed);
     qproperty!("aoDpi", Read = ao_dpi, Write = set_ao_dpi, Notify = ao_dpi_changed);
+    qproperty!("aoDpiAuto", Read = ao_dpi_auto, Write = set_ao_dpi_auto, Notify = ao_dpi_changed);
     qproperty!("aoViewAreaTop", Read = ao_view_area_top, Write = set_ao_view_area_top, Notify = ao_geometry_changed);
     qproperty!("aoViewAreaBottom", Read = ao_view_area_bottom, Write = set_ao_view_area_bottom, Notify = ao_geometry_changed);
     qproperty!("aoViewAreaLeft", Read = ao_view_area_left, Write = set_ao_view_area_left, Notify = ao_geometry_changed);
@@ -304,6 +310,10 @@ impl SettingsStore {
 
     pub fn ao_dpi(&self) -> f64 {
         self.ao_dpi
+    }
+
+    pub fn ao_dpi_auto(&self) -> bool {
+        self.ao_dpi_auto
     }
 
     pub fn ao_view_area_top(&self) -> u32 {
@@ -395,6 +405,12 @@ impl SettingsStore {
         self.ao_dpi = value;
         self.ao_dpi_changed();
         update(|s| s.ao_dpi = value);
+    }
+
+    pub fn set_ao_dpi_auto(&mut self, value: bool) {
+        self.ao_dpi_auto = value;
+        self.ao_dpi_changed();
+        update(|s| s.ao_dpi_auto = value);
     }
 
     pub fn set_ao_view_area_top(&mut self, value: u32) {

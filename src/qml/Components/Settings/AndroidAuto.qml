@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import avio_qt
+import ".."
 
 ColumnLayout {
     readonly property bool connected: StatusStore.aaStatus === "connected" || StatusStore.aaStatus === "host-ui"
@@ -55,6 +56,8 @@ ColumnLayout {
 
             trailing: SettingsChips {
                 options: [
+                    { label: "Auto", value: "auto" },
+                    { label: "480p", value: "480p" },
                     { label: "720p", value: "720p" },
                     { label: "1080p", value: "1080p" }
                 ]
@@ -80,14 +83,30 @@ ColumnLayout {
         SettingsRow {
             iconSource: "../../../assets/icons/mdi/image-size-select-large.png"
             title: "Dpi"
+            subtitle: SettingsStore.aoDpiAuto ? "Picked from the video resolution and the screen size when a phone connects" : ""
 
-            trailing: Label {
-                text: Math.round(SettingsStore.aoDpi)
-                color: Theme.primary
-                font.pixelSize: 14
+            trailing: RowLayout {
+                spacing: 16
+
+                Label {
+                    visible: !SettingsStore.aoDpiAuto
+                    text: Math.round(SettingsStore.aoDpi)
+                    color: Theme.primary
+                    font.pixelSize: 14
+                }
+                Label {
+                    text: "Auto"
+                    color: Theme.onSurfaceVariant
+                    font.pixelSize: 14
+                }
+                M3Switch {
+                    checked: SettingsStore.aoDpiAuto
+                    onToggled: SettingsStore.aoDpiAuto = checked
+                }
             }
         }
         SettingsSlider {
+            visible: !SettingsStore.aoDpiAuto
             Layout.leftMargin: 28
             Layout.rightMargin: 28
             Layout.bottomMargin: 8
