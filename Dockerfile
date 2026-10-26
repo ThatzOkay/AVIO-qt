@@ -43,11 +43,21 @@ WORKDIR /app
 RUN mkdir /out
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY src ./src
+
+# Dependencies (and the path crates, which sit under crates/) first, against a stub main.rs, so
+# this expensive layer is cached until Cargo.toml, Cargo.lock or crates/ change. The target dir
+# is deliberately not a cache mount: mounts aren't part of the layer, so CI (buildx's GHA cache
+# exports layers only) could never reuse it. Matters most for armv7, which builds under QEMU.
+RUN mkdir src && echo 'fn main() {}' > src/main.rs
 RUN --mount=type=cache,target=/opt/cargo/registry \
-    --mount=type=cache,id=avio-qt-target-${TARGETARCH},target=/app/target \
     cargo build --release --locked \
-    && cargo build --release --locked -p gst-video --bin gst-host \
+    && cargo build --release --locked -p gst-video --bin gst-host
+
+COPY src ./src
+# The stub's mtime can be newer than the copied sources', which would make cargo skip the rebuild
+RUN --mount=type=cache,target=/opt/cargo/registry \
+    touch src/main.rs \
+    && cargo build --release --locked \
     && cp target/release/avio_qt target/release/gst-host /out/
 
 # `docker build --target artifact --output out .` writes just the binaries: the app and its
