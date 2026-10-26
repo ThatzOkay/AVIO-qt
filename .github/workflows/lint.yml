@@ -1,0 +1,52 @@
+name: lint
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  clippy:
+    name: Clippy (Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      # Same packages as the Dockerfile's build stage
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl pkg-config perl protobuf-compiler \
+            qt6-base-dev qt6-base-private-dev qt6-declarative-dev qt6-declarative-private-dev qt6-base-dev-tools \
+            libasound2-dev libpulse-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            librtlsdr-dev libfftw3-dev libbz2-dev
+
+      # qt-build-utils (qtbridge's build script) runs libexec/qtpaths, which Debian/Ubuntu may
+      # leave dangling; only bin/qtpaths6 is reliable.
+      - name: Fix qtpaths
+        run: |
+          set -euo pipefail
+          QT_DIR="$(dirname "$(dirname "$(command -v qmake6)")")"
+          sudo mkdir -p "$QT_DIR/libexec"
+          sudo ln -sf "$QT_DIR/bin/qtpaths6" "$QT_DIR/libexec/qtpaths"
+          echo "QMAKE=$(command -v qmake6)" >> "$GITHUB_ENV"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # No `-D warnings` yet: the tree still has warnings (radio_channel naming, unused imports)
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked

@@ -1,0 +1,152 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'ID of successful build run (leave empty = latest on main)'
+        required: false
+      draft:
+        description: 'Create as draft?'
+        type: boolean
+        default: true
+
+jobs:
+  create_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Pick build run ID
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
+        run: |
+          if [[ -z "$INPUT_RUN_ID" ]]; then
+            RUN=$(gh run list --repo "$REPO" \
+                               --workflow build.yml \
+                               -b main \
+                               -s success \
+                               -L 1 \
+                               --json databaseId \
+                               -q '.[0].databaseId')
+          else
+            RUN="$INPUT_RUN_ID"
+          fi
+          if [[ -z "$RUN" ]]; then
+            echo "::error::No suitable build run found."
+            exit 1
+          fi
+          echo "run_id=$RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Get commit SHA
+        id: sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          SHA=$(gh run view "${{ steps.pick.outputs.run_id }}" \
+                 --repo "$REPO" \
+                 --json headSha \
+                 -q .headSha)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # GITHUB_TOKEN cannot create a tag pointing at an arbitrary commit SHA whose tree touches
+      # .github/workflows/*, but targeting a branch NAME works. That's only safe when the branch
+      # tip IS the commit being released, so an older pinned build_run_id must fail loudly here
+      # (releasing it needs a PAT with repo+workflow scope).
+      - name: Resolve safe release target
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          SHA="${{ steps.sha.outputs.sha }}"
+          MAIN_SHA=$(gh api "repos/$REPO/commits/main" --jq .sha)
+
+          if [[ "$SHA" == "$MAIN_SHA" ]]; then
+            echo "target=main" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Selected build's commit ($SHA) is not the current tip of main ($MAIN_SHA). GITHUB_TOKEN cannot tag an older commit whose tree touches .github/workflows/* - releasing a pinned older build_run_id needs a PAT with repo+workflow scope instead of the default token."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.sha.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Read version
+        id: ver
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Could not read version from Cargo.toml."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Get release date (Europe/Berlin)
+        id: rel_date
+        run: |
+          echo "date=$(TZ=Europe/Berlin date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure release tag does not already exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::error::Release with tag $TAG already exists."
+            exit 1
+          fi
+
+      # One artifact per platform (avio-qt-<os>-<arch>), each a single .tar.gz or .zip
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ steps.pick.outputs.run_id }}
+          path: release-assets
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          REL_DATE: ${{ steps.rel_date.outputs.date }}
+          DRAFT: ${{ github.event.inputs.draft }}
+        run: |
+          TAG="v${VERSION}"
+
+          args=(
+            "$TAG"
+            --repo "$REPO"
+            --target "${{ steps.target.outputs.target }}"
+            --title "v${VERSION} (${REL_DATE})"
+            --notes "## Release Notes – v${VERSION}
+
+          ### Fix
+
+          ### Improvements
+
+          ### Feature
+
+          ### Chores"
+          )
+
+          if [[ "$DRAFT" == "true" ]]; then
+            args+=(--draft)
+          fi
+
+          while IFS= read -r -d '' file; do
+            args+=("$file")
+          done < <(find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0)
+
+          gh release create "${args[@]}"

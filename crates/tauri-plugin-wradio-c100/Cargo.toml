@@ -1,0 +1,42 @@
+[package]
+name = "tauri-plugin-wradio-c100"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Tauri v2 plugin wrapping wradio-c100-core: device/scan/tune/service commands, live DAB+ metadata events, and persisted station presets (via tauri-plugin-store)."
+# Required by the `tauri-plugin` build-support crate (build.rs) -- it
+# refuses to run unless this matches `package.name` exactly, since it
+# uses the native `links` mechanism to pass generated permission schema
+# paths to dependents via `DEP_<LINKS>_...` build-script env vars.
+links = "tauri-plugin-wradio-c100"
+
+[dependencies]
+wradio-c100-core = { path = "../wradio-c100-core" }
+# Same VID/PID device-presence check `list_devices` needs -- kept as the
+# exact API already verified working in `wradio-c100-core/src/usb.rs`
+# (`nusb::list_devices()` + `.vendor_id()`/`.product_id()`), pinned to the
+# same version so the two crates' `nusb` types don't diverge.
+nusb = "0.2"
+# Only for `hotplug.rs`'s `HotplugWatch: Stream` consumption
+# (`StreamExt::next`) -- same crate `wradio-c100-core` already pins for
+# the same reason, not a new dependency family for the workspace.
+futures-lite = "2"
+tauri = "2"
+tauri-plugin-store = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "process", "io-util"] }
+tracing = "0.1"
+# Native audio playback (playback.rs) -- see that module's own doc comment
+# for the full story of why `ffmpeg` (a subprocess, piped ADTS in/f32le
+# PCM out) rather than a Rust AAC decoder crate: `syom` (a pure-Rust
+# HE-AAC decoder, tried first) has a real bug with DAB+'s implicit SBR
+# streaming pattern. `cpal` is `RUST_PORT_PROMPT.md`'s own named choice
+# for the output side; `rtrb` is the lock-free SPSC ring buffer
+# connecting the async ffmpeg-stdout-reader task to cpal's realtime
+# callback without ever locking a mutex there.
+cpal = "0.18"
+rtrb = "0.4"
+
+[build-dependencies]
+tauri-plugin = "2"

@@ -1,0 +1,16 @@
+[package]
+name = "welle-io-sys"
+version = "0.1.0"
+edition = "2021"
+links = "welle-io-sys"
+
+[lib]
+name = "welle_io_sys"
+
+[build-dependencies]
+cxx-build = "1"
+
+[dependencies]
+num-complex = "0.4"
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+cxx = "1"

@@ -1,0 +1,11 @@
+[wrap-git]
+url = https://gitlab.freedesktop.org/wlroots/wlroots.git
+revision = 0.20
+# wlroots-avio.patch: host-output fullscreen/minimize control for app-kiosk, and request
+#   client-side decorations so the host WM (e.g. labwc) draws no titlebar over our own.
+# wlroots-avio-touch.patch: multi-output touch in the wayland backend (upstream pending).
+diff_files = wlroots-avio.patch, wlroots-avio-touch.patch
+
+[provide]
+dependency_names = wlroots-0.20
+wlroots-0.20 = wlroots

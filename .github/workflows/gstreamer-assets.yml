@@ -1,0 +1,255 @@
+name: gstreamer assets
+run-name: 'gstreamer-assets → ${{ github.ref_name }}'
+
+# Rebuilds the bundled GStreamer runtime (src/assets/gstreamer/<platform>) from Debian forky
+# (Linux) or the official universal package (macOS) and
+# commits it back to the branch. The bundles are ignored locally, only this workflow adds them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      linux_x64:
+        description: 'Build Linux x64 bundle'
+        type: boolean
+        default: true
+      linux_arm64:
+        description: 'Build Linux arm64 bundle'
+        type: boolean
+        default: true
+      macos_arm64:
+        description: 'Build macOS arm64 bundle'
+        type: boolean
+        default: true
+      macos_x64:
+        description: 'Build macOS x64 bundle'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    name: Plan asset matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      is_empty: ${{ steps.plan.outputs.is_empty }}
+
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          IN_LINUX_X64: ${{ inputs.linux_x64 }}
+          IN_LINUX_ARM64: ${{ inputs.linux_arm64 }}
+          IN_MACOS_ARM64: ${{ inputs.macos_arm64 }}
+          IN_MACOS_X64: ${{ inputs.macos_x64 }}
+        run: |
+          set -euo pipefail
+
+          include=()
+          if [[ "$IN_LINUX_X64" == "true" ]]; then
+            include+=('{"os":"linux","runner":"ubuntu-24.04","platform":"linux/amd64","dir_name":"linux-x64"}')
+          fi
+          if [[ "$IN_LINUX_ARM64" == "true" ]]; then
+            include+=('{"os":"linux","runner":"ubuntu-24.04-arm","platform":"linux/arm64/v8","dir_name":"linux-arm64"}')
+          fi
+          if [[ "$IN_MACOS_ARM64" == "true" ]]; then
+            include+=('{"os":"macos","runner":"macos-latest","platform":"","dir_name":"macos-arm64"}')
+          fi
+          if [[ "$IN_MACOS_X64" == "true" ]]; then
+            include+=('{"os":"macos","runner":"macos-15-intel","platform":"","dir_name":"macos-x64"}')
+          fi
+
+          joined="$(IFS=,; echo "${include[*]}")"
+          echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+          if [[ ${#include[@]} -eq 0 ]]; then
+            echo "is_empty=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build assets (${{ matrix.dir_name }})
+    needs: plan
+    if: ${{ needs.plan.outputs.is_empty != 'true' }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build bundle [${{ matrix.dir_name }} via Debian forky]
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run --rm --platform=${{ matrix.platform }} \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -w /work \
+            debian:forky-slim sh -lc '
+              set -euo pipefail
+
+              export DEBIAN_FRONTEND=noninteractive
+
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                bash coreutils findutils file python3 dpkg-dev patchelf ca-certificates \
+                gstreamer1.0-tools \
+                gstreamer1.0-plugins-base \
+                gstreamer1.0-plugins-base-apps \
+                gstreamer1.0-plugins-good \
+                gstreamer1.0-plugins-bad \
+                gstreamer1.0-libav \
+                gstreamer1.0-gl \
+                gstreamer1.0-x \
+                gstreamer1.0-alsa \
+                gstreamer1.0-pulseaudio \
+                libgstreamer1.0-0 \
+                libgstreamer-plugins-base1.0-0 \
+                libglib2.0-0 \
+                liborc-0.4-0 \
+                libgudev-1.0-0 \
+                zlib1g \
+                libc6 \
+                libgcc-s1 \
+                libstdc++6
+
+              scripts/gstreamer/package-linux.sh "src/assets/gstreamer/${{ matrix.dir_name }}"
+              scripts/gstreamer/smoke-test-linux.sh "src/assets/gstreamer/${{ matrix.dir_name }}"
+
+              VERSION="$(src/assets/gstreamer/${{ matrix.dir_name }}/bin/gst-launch-1.0 --version | awk '"'"'/^gst-launch-1.0 version / { print $3; exit }'"'"')"
+              printf "%s\n" "$VERSION" > src/assets/gstreamer/${{ matrix.dir_name }}/version.txt
+              echo "Version: $VERSION"
+            '
+
+      # The official macOS package is universal (arm64+x64), so both lanes use the same download
+      - name: Download GStreamer runtime pkg [macos]
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GStreamer uses GNOME-style versioning: even minor = stable, odd = dev.
+          GST_VERSION=$(curl -fsSL https://gstreamer.freedesktop.org/data/pkg/osx/ \
+            | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/"' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+            | awk -F. '$2 % 2 == 0' \
+            | sort -V \
+            | tail -1)
+          [ -n "$GST_VERSION" ] || { echo "Failed to resolve latest stable GStreamer version"; exit 1; }
+          curl -fL -o gstreamer-runtime.pkg \
+            "https://gstreamer.freedesktop.org/data/pkg/osx/${GST_VERSION}/gstreamer-1.0-${GST_VERSION}-universal.pkg"
+          sudo installer -pkg gstreamer-runtime.pkg -target /
+
+      - name: Build bundle [${{ matrix.dir_name }}]
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/gstreamer/package-macos.sh "src/assets/gstreamer/${{ matrix.dir_name }}"
+          scripts/gstreamer/smoke-test-macos.sh "src/assets/gstreamer/${{ matrix.dir_name }}"
+          VERSION="$(src/assets/gstreamer/${{ matrix.dir_name }}/bin/gst-launch-1.0 --version | awk '/^gst-launch-1.0 version / { print $3; exit }')"
+          printf '%s\n' "$VERSION" > "src/assets/gstreamer/${{ matrix.dir_name }}/version.txt"
+          echo "Version: $VERSION"
+
+      - name: Fix file permissions
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo chown -R "$USER:$USER" "src/assets/gstreamer/${{ matrix.dir_name }}" 2>/dev/null || true
+          sudo chmod -R a+rX "src/assets/gstreamer/${{ matrix.dir_name }}" 2>/dev/null || true
+
+      - name: Pack artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C src/assets/gstreamer -czf "gstreamer-${{ matrix.dir_name }}.tar.gz" "${{ matrix.dir_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gstreamer-${{ matrix.dir_name }}
+          path: gstreamer-${{ matrix.dir_name }}.tar.gz
+          retention-days: 7
+
+  publish:
+    name: Publish gstreamer assets
+    needs:
+      - plan
+      - build
+    if: ${{ needs.plan.outputs.is_empty != 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: gstreamer-*
+          path: .artifacts
+
+      - name: Extract artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src/assets/gstreamer
+          for archive in .artifacts/*/*.tar.gz; do
+            name="$(basename "$archive" .tar.gz)"
+            rm -rf "src/assets/gstreamer/${name#gstreamer-}"
+            tar -C src/assets/gstreamer -xzf "$archive"
+          done
+
+      - name: Commit and push assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # One commit per platform. The bundles are gitignored, hence add -f
+          changed=false
+          for plat in linux-x64 linux-arm64 macos-arm64 macos-x64; do
+            dir="src/assets/gstreamer/${plat}"
+            [[ -d "$dir" ]] || continue
+            git add -f -A "$dir"
+            if git diff --cached --quiet -- "$dir"; then
+              continue
+            fi
+            ver=""
+            [[ -f "$dir/version.txt" ]] && ver="$(cat "$dir/version.txt")"
+
+            # Show which Debian package(s) actually changed (Linux only)
+            detail=""
+            if [[ "$plat" == linux-* && -f "$dir/packages.txt" ]]; then
+              old="$(git show "HEAD:$dir/packages.txt" 2>/dev/null || true)"
+              if [[ -n "$old" ]]; then
+                detail="$(comm -13 <(printf '%s\n' "$old" | sort -u) <(sort -u "$dir/packages.txt") | paste -sd', ' -)"
+              fi
+            fi
+
+            if [[ -n "$detail" ]]; then
+              git commit -m "chore(gstreamer): update ${plat} bundle (${detail})"
+            elif [[ -n "$ver" ]]; then
+              git commit -m "chore(gstreamer): update ${plat} bundle to ${ver}"
+            else
+              git commit -m "chore(gstreamer): update ${plat} bundle"
+            fi
+            changed=true
+          done
+
+          if [[ "$changed" == "true" ]]; then
+            git push
+          else
+            echo "No asset changes to commit"
+          fi

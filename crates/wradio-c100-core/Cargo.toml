@@ -1,0 +1,20 @@
+[package]
+name = "wradio-c100-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Async Rust DAB+ core for the wRadio C100 / Raontech-based USB DAB dongle (VID:PID 16c0:05dc), ported from the wradio-c100 C++ codebase."
+
+[dependencies]
+nusb = { version = "0.2", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-std", "io-util"] }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-lite = "2"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

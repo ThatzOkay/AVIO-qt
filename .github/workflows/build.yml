@@ -1,0 +1,439 @@
+name: build
+run-name: 'build → ${{ github.event.workflow_run.head_branch || github.ref_name }}'
+
+on:
+  workflow_run:
+    workflows: ['lint']
+    branches: [main]
+    types: [completed]
+
+  # Manual runs build the branch the workflow is dispatched on
+  workflow_dispatch:
+    inputs:
+      linux_x64:
+        description: 'Build Linux x64'
+        type: boolean
+        default: true
+      linux_arm64:
+        description: 'Build Linux arm64 (ARMv8)'
+        type: boolean
+        default: true
+      linux_armv7:
+        description: 'Build Linux armv7 (Surface RT / Buildroot, QEMU, slow)'
+        type: boolean
+        default: true
+      macos_arm64:
+        description: 'Build macOS arm64'
+        type: boolean
+        default: true
+      macos_x64:
+        description: 'Build macOS x64 (Intel)'
+        type: boolean
+        default: true
+      windows_x64:
+        description: 'Build Windows x64'
+        type: boolean
+        default: true
+      windows_arm64:
+        description: 'Build Windows arm64 (experimental, expected to fail until welle.io/librtlsdr support it)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  plan:
+    name: Plan build matrix
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      is_empty: ${{ steps.plan.outputs.is_empty }}
+    steps:
+      - id: plan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_LINUX_X64: ${{ inputs.linux_x64 }}
+          IN_LINUX_ARM64: ${{ inputs.linux_arm64 }}
+          IN_LINUX_ARMV7: ${{ inputs.linux_armv7 }}
+          IN_MACOS_ARM64: ${{ inputs.macos_arm64 }}
+          IN_MACOS_X64: ${{ inputs.macos_x64 }}
+          IN_WINDOWS_X64: ${{ inputs.windows_x64 }}
+          IN_WINDOWS_ARM64: ${{ inputs.windows_arm64 }}
+        run: |
+          set -euo pipefail
+
+          # Every lane is native to its runner, except linux-armv7 which runs the Dockerfile
+          # under QEMU. Fields: os, runner, arch, docker platform (linux only)
+          lanes=(
+            'linux|ubuntu-latest|x64|linux/amd64'
+            'linux|ubuntu-24.04-arm|arm64|linux/arm64/v8'
+            'linux|ubuntu-latest|armv7|linux/arm/v7'
+            'macos|macos-latest|arm64|'
+            'macos|macos-15-intel|x64|'
+            'windows|windows-latest|x64|'
+            'windows|windows-11-arm|arm64|'
+          )
+          wanted() {
+            # main builds everything except the experimental lane, manual runs follow the inputs
+            if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+              [[ "$1" != "windows-arm64" ]]
+              return
+            fi
+            case "$1" in
+              linux-x64) [[ "$IN_LINUX_X64" == "true" ]] ;;
+              linux-arm64) [[ "$IN_LINUX_ARM64" == "true" ]] ;;
+              linux-armv7) [[ "$IN_LINUX_ARMV7" == "true" ]] ;;
+              macos-arm64) [[ "$IN_MACOS_ARM64" == "true" ]] ;;
+              macos-x64) [[ "$IN_MACOS_X64" == "true" ]] ;;
+              windows-x64) [[ "$IN_WINDOWS_X64" == "true" ]] ;;
+              windows-arm64) [[ "$IN_WINDOWS_ARM64" == "true" ]] ;;
+            esac
+          }
+
+          include=()
+          for lane in "${lanes[@]}"; do
+            IFS='|' read -r os runner arch platform <<< "$lane"
+            wanted "${os}-${arch}" || continue
+            experimental=false
+            [[ "${os}-${arch}" == "windows-arm64" ]] && experimental=true
+            include+=("{\"os\":\"${os}\",\"runner\":\"${runner}\",\"arch\":\"${arch}\",\"platform\":\"${platform}\",\"experimental\":${experimental}}")
+          done
+
+          joined="$(IFS=,; echo "${include[*]:-}")"
+          echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+          if [[ ${#include[@]} -eq 0 ]]; then
+            echo "is_empty=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.os }}-${{ matrix.arch }}) on ${{ github.event.workflow_run.head_branch || github.ref_name }}
+    needs: plan
+    if: ${{ needs.plan.outputs.is_empty != 'true' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    continue-on-error: ${{ matrix.experimental }}
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    env:
+      PACKAGE: avio-qt-${{ matrix.os }}-${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          # Dispatch builds the ref the workflow was started on, workflow_run pins the head sha
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || github.event.workflow_run.head_sha }}
+
+      # ----------------------------
+      # Linux (Dockerfile: Debian forky, so the result matches the Buildroot/Pi targets)
+      # ----------------------------
+      - name: Set up QEMU [linux-armv7]
+        if: matrix.os == 'linux' && matrix.arch == 'armv7'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Set up Docker Buildx [linux]
+        if: matrix.os == 'linux'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build [linux]
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --platform "${{ matrix.platform }}" \
+            --build-arg JOBS="$(nproc)" \
+            --cache-from "type=gha,scope=${{ matrix.arch }}" \
+            --cache-to "type=gha,scope=${{ matrix.arch }},mode=max" \
+            --target artifact --output type=local,dest=out .
+
+      # The app looks for gst-host-<ARCH>-unknown-linux-gnu next to itself (ARCH is rust's
+      # std::env::consts::ARCH, so "arm" on armv7) and for assets/ next to the executable.
+      - name: Package [linux]
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.arch }}" in
+            x64) rust_arch=x86_64 ;;
+            arm64) rust_arch=aarch64 ;;
+            armv7) rust_arch=arm ;;
+          esac
+          mkdir -p "$PACKAGE"
+          install -m755 out/avio_qt "$PACKAGE/avio_qt"
+          install -m755 out/gst-host "$PACKAGE/gst-host-${rust_arch}-unknown-linux-gnu"
+          # Everything but the GStreamer bundles of other platforms. armv7 has none, it uses the
+          # system GStreamer (see src/audio/gstreamer.rs).
+          mkdir -p "$PACKAGE/assets"
+          rsync -a --exclude 'gstreamer/*-*/' src/assets/ "$PACKAGE/assets/"
+          if [[ -d "src/assets/gstreamer/linux-${{ matrix.arch }}" ]]; then
+            mkdir -p "$PACKAGE/assets/gstreamer"
+            cp -a "src/assets/gstreamer/linux-${{ matrix.arch }}" "$PACKAGE/assets/gstreamer/"
+          fi
+          tar -czf "$PACKAGE.tar.gz" "$PACKAGE"
+
+      # ----------------------------
+      # macOS (native on both runners)
+      # ----------------------------
+      - name: Install Rust toolchain [macos, windows]
+        if: matrix.os != 'linux'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo [macos, windows]
+        if: matrix.os != 'linux'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.arch }}-v1
+
+      - name: Install deps (brew) [macos]
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          set -euo pipefail
+          for pkg in pkg-config protobuf librtlsdr fftw qt; do
+            brew list --versions "$pkg" >/dev/null || brew install "$pkg" >/dev/null
+          done
+          # qt-build-utils finds Qt through qmake
+          echo "QMAKE=$(brew --prefix qt)/bin/qmake" >> "$GITHUB_ENV"
+
+      - name: Resolve GStreamer version [macos]
+        id: gstver_mac
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          GST_VERSION=$(curl -fsSL https://gstreamer.freedesktop.org/data/pkg/osx/ \
+            | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/"' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+            | awk -F. '$2 % 2 == 0' \
+            | sort -V \
+            | tail -1)
+          [ -n "$GST_VERSION" ] || { echo "Failed to resolve GStreamer version"; exit 1; }
+          echo "version=$GST_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache GStreamer pkgs [macos]
+        id: gstcache_mac
+        if: matrix.os == 'macos'
+        uses: actions/cache@v6
+        with:
+          path: |
+            gst-runtime.pkg
+            gst-devel.pkg
+          key: gst-pkg-macos-universal-${{ steps.gstver_mac.outputs.version }}
+
+      - name: Download GStreamer pkgs [macos]
+        if: matrix.os == 'macos' && steps.gstcache_mac.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://gstreamer.freedesktop.org/data/pkg/osx/${{ steps.gstver_mac.outputs.version }}"
+          curl -fL -o gst-runtime.pkg "${base}/gstreamer-1.0-${{ steps.gstver_mac.outputs.version }}-universal.pkg"
+          curl -fL -o gst-devel.pkg "${base}/gstreamer-1.0-devel-${{ steps.gstver_mac.outputs.version }}-universal.pkg"
+
+      - name: Install GStreamer (runtime + devel) [macos]
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo installer -pkg gst-runtime.pkg -target /
+          sudo installer -pkg gst-devel.pkg -target /
+          FRAMEWORK_ROOT="/Library/Frameworks/GStreamer.framework/Versions/1.0"
+          [ -d "$FRAMEWORK_ROOT" ] || { echo "GStreamer.framework not found" >&2; exit 1; }
+          echo "PKG_CONFIG_PATH=$FRAMEWORK_ROOT/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "$FRAMEWORK_ROOT/bin" >> "$GITHUB_PATH"
+
+      - name: Build [macos]
+        if: matrix.os == 'macos'
+        shell: bash
+        run: cargo build --release --locked --workspace --bins
+
+      # macdeployqt wants a .app, which we don't build, so Qt is left to the system (brew install qt)
+      - name: Package [macos]
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PACKAGE/assets"
+          install -m755 target/release/avio_qt "$PACKAGE/avio_qt"
+          rsync -a --exclude 'gstreamer/*-*/' src/assets/ "$PACKAGE/assets/"
+          if [[ -d "src/assets/gstreamer/macos-${{ matrix.arch }}" ]]; then
+            mkdir -p "$PACKAGE/assets/gstreamer"
+            cp -a "src/assets/gstreamer/macos-${{ matrix.arch }}" "$PACKAGE/assets/gstreamer/"
+          fi
+          tar -czf "$PACKAGE.tar.gz" "$PACKAGE"
+
+      # ----------------------------
+      # Windows
+      # ----------------------------
+      # x64: welle.io's vendored C++ uses GCC-only syntax MSVC rejects, so this leg builds with the
+      # GNU toolchain (Qt's MinGW kit + MSYS2 for fftw/perl). arm64 has no MinGW kit or librtlsdr
+      # build, it tries MSVC and is expected to fail (experimental).
+      - name: Install Qt [windows-x64]
+        if: matrix.os == 'windows' && matrix.arch == 'x64'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: win64_mingw
+          tools: tools_mingw1310
+          cache: true
+
+      - name: Install Qt [windows-arm64]
+        if: matrix.os == 'windows' && matrix.arch == 'arm64'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_arm64
+          host: windows_arm64
+          cache: true
+
+      - name: Install MinGW-w64 toolchain [windows-x64]
+        if: matrix.os == 'windows' && matrix.arch == 'x64'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-fftw mingw-w64-x86_64-bzip2 perl
+
+      # PERL needs pinning: bare `perl` resolves to Strawberry's POSIX-hostile one, which
+      # OpenSSL's vendored Configure rejects for a mingw64 target.
+      - name: Resolve MSYS2 paths [windows-x64]
+        if: matrix.os == 'windows' && matrix.arch == 'x64'
+        shell: msys2 {0}
+        run: |
+          echo "PERL=$(cygpath -m /usr/bin/perl.exe)" >> "$GITHUB_ENV"
+          echo "MSYS2_MINGW64_ROOT=$(cygpath -m /mingw64)" >> "$GITHUB_ENV"
+
+      - name: Switch to GNU Rust toolchain [windows-x64]
+        if: matrix.os == 'windows' && matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install stable-x86_64-pc-windows-gnu
+          rustup default stable-x86_64-pc-windows-gnu
+
+      - name: Resolve GStreamer version [windows-x64]
+        id: gstver_win
+        if: matrix.os == 'windows' && matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $listing = (Invoke-WebRequest -Uri 'https://gstreamer.freedesktop.org/data/pkg/windows/' -UseBasicParsing).Content
+          $versions = [regex]::Matches($listing, 'href="([0-9]+\.[0-9]+\.[0-9]+)/"') |
+            ForEach-Object { [Version]$_.Groups[1].Value } |
+            Where-Object { $_.Minor % 2 -eq 0 } |
+            Sort-Object
+          if (-not $versions -or $versions.Count -eq 0) { throw 'Failed to resolve GStreamer version' }
+          "version=$($versions[-1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Cache GStreamer installer [windows-x64]
+        id: gstcache_win
+        if: matrix.os == 'windows' && matrix.arch == 'x64'
+        uses: actions/cache@v6
+        with:
+          path: gstreamer-mingw-x86_64.exe
+          key: gst-exe-windows-mingw-x86_64-${{ steps.gstver_win.outputs.version }}
+
+      - name: Download GStreamer installer [windows-x64]
+        if: matrix.os == 'windows' && matrix.arch == 'x64' && steps.gstcache_win.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = '${{ steps.gstver_win.outputs.version }}'
+          curl.exe -L "https://gstreamer.freedesktop.org/data/pkg/windows/$v/mingw/gstreamer-1.0-mingw-x86_64-$v.exe" -o 'gstreamer-mingw-x86_64.exe'
+
+      - name: Install GStreamer (runtime + devel) [windows-x64]
+        if: matrix.os == 'windows' && matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Start-Process -FilePath '.\gstreamer-mingw-x86_64.exe' `
+            -ArgumentList @('/SP-', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TYPE=devel') -PassThru
+          if (-not $p.WaitForExit(180000)) { try { $p.Kill() } catch {}; throw 'GStreamer installer timed out' }
+          if ($p.ExitCode -ne 0) { throw "GStreamer installer failed with exit code $($p.ExitCode)" }
+
+          $root = "$env:ProgramFiles\gstreamer\1.0\mingw_x86_64"
+          if (-not (Test-Path "$root\lib\pkgconfig\gstreamer-1.0.pc")) { throw "GStreamer dev libs not found at $root" }
+          # 8.3 short path so the space in "Program Files" can't break include/lib paths
+          $shortRoot = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($root).ShortPath
+          "PKG_CONFIG_PATH=$shortRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # aa-proto's build.rs passes all .proto files as separate args. Chocolatey's protoc is a
+      # .bat shim going through cmd.exe, whose command-line limit that blows through; the release
+      # zip's plain protoc.exe doesn't have that limit.
+      - name: Install protoc [windows]
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          PROTOC_VERSION: '35.1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'protoc'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          curl.exe -fL "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip" -o "$dir\protoc.zip"
+          Expand-Archive -Path "$dir\protoc.zip" -DestinationPath $dir -Force
+          "PROTOC=$dir\bin\protoc.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # librtlsdr.dll re-exports its own statically-linked pthread_* symbols, colliding with
+      # MinGW's libpthread.a at link time. librtlsdr itself is vendored (crates/rtl-sdr/vendor).
+      - name: Build [windows]
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: ${{ matrix.arch == 'x64' && '-C link-arg=-Wl,--allow-multiple-definition' || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked --workspace --bins
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+
+      # windeployqt copies the Qt DLLs and QML modules next to the exe; GStreamer's runtime (DLLs,
+      # plugins, scanner) comes from the installed mingw runtime, as no bundle script exists for it.
+      - name: Package [windows]
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = $env:PACKAGE
+          New-Item -ItemType Directory -Force -Path "$pkg\assets" | Out-Null
+          Copy-Item target\release\avio_qt.exe "$pkg\"
+          Copy-Item target\release\gst-host.exe "$pkg\" -ErrorAction SilentlyContinue
+          Copy-Item crates\rtl-sdr\vendor\windows-x64\librtlsdr.dll "$pkg\" -ErrorAction SilentlyContinue
+          Get-ChildItem src\assets | Where-Object { $_.Name -ne 'gstreamer' } | Copy-Item -Destination "$pkg\assets" -Recurse
+          windeployqt --release --qmldir src\qml "$pkg\avio_qt.exe"
+
+          $gst = "$env:ProgramFiles\gstreamer\1.0\mingw_x86_64"
+          if ('${{ matrix.arch }}' -eq 'x64' -and (Test-Path $gst)) {
+            $dest = "$pkg\assets\gstreamer\windows-x64"
+            New-Item -ItemType Directory -Force -Path "$dest\bin","$dest\lib" | Out-Null
+            Copy-Item "$gst\bin\*" "$dest\bin" -Recurse
+            Copy-Item "$gst\lib\gstreamer-1.0" "$dest\lib" -Recurse
+            if (Test-Path "$gst\libexec") { Copy-Item "$gst\libexec" "$dest" -Recurse }
+          }
+          Compress-Archive -Path $pkg -DestinationPath "$pkg.zip"
+
+      # ----------------------------
+      # Upload
+      # ----------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE }}
+          path: |
+            ${{ env.PACKAGE }}.tar.gz
+            ${{ env.PACKAGE }}.zip
+          if-no-files-found: error
+          retention-days: 14
