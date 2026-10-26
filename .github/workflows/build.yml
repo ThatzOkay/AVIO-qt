@@ -278,6 +278,7 @@ jobs:
       # ----------------------------
       # Windows
       # ----------------------------
+      # qtbridge needs Qt >= 6.10.
       # x64: welle.io's vendored C++ uses GCC-only syntax MSVC rejects, so this leg builds with the
       # GNU toolchain (Qt's MinGW kit + MSYS2 for fftw/perl). arm64 has no MinGW kit or librtlsdr
       # build, it tries MSVC and is expected to fail (experimental).
@@ -285,7 +286,7 @@ jobs:
         if: matrix.os == 'windows' && matrix.arch == 'x64'
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.3'
+          version: '6.10.1'
           arch: win64_mingw
           tools: tools_mingw1310
           cache: true
@@ -294,7 +295,7 @@ jobs:
         if: matrix.os == 'windows' && matrix.arch == 'arm64'
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.3'
+          version: '6.10.1'
           arch: win64_msvc2022_arm64
           host: windows_arm64
           cache: true
