@@ -51,4 +51,5 @@ windows = { version = "0.62.0", features = [
     "Win32_Media_Audio",
     "Win32_System_Com",
 ] }
-windows-core = "0.100.0"
+# Must be the version `windows` itself uses: the `interface` macro expands to `windows_core::` paths
+windows-core = "0.62"
