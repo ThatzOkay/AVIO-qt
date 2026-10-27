@@ -391,13 +391,20 @@ jobs:
 
       # librtlsdr.dll re-exports its own statically-linked pthread_* symbols, colliding with
       # MinGW's libpthread.a at link time. librtlsdr itself is vendored (crates/rtl-sdr/vendor).
+      #
+      # The libm symbols (round, fma, cbrt, ...) came up undefined at link time although Qt's MinGW
+      # libmingwex defines them, so another libmingwex is probably found first. Naming the
+      # compiler's own copy at the end of the link line settles that.
       - name: Build [windows]
         if: matrix.os == 'windows'
         shell: pwsh
-        env:
-          RUSTFLAGS: ${{ matrix.arch == 'x64' && '-C link-arg=-Wl,--allow-multiple-definition' || '' }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            $mingwex = ((& x86_64-w64-mingw32-gcc -print-file-name=libmingwex.a) -join '').Trim() -replace '\\', '/'
+            Write-Host "libmingwex: $mingwex"
+            $env:RUSTFLAGS = "-C link-arg=-Wl,--allow-multiple-definition -C link-arg=$mingwex"
+          }
           cargo build --release --locked --workspace --bins
           if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
