@@ -7,12 +7,14 @@ use tokio::sync::mpsc;
 
 use crate::store::{radio_store, settings_store};
 use dab::{DabStation, DabTuner};
+use slide_cache::file_url;
 use fm::FmTuner;
 
 pub mod channels;
 pub mod dab;
 pub mod fm;
 pub mod hardware;
+pub mod slide_cache;
 pub mod wradio_backend;
 
 /// Poked by the tuners whenever something the UI shows changed on its own (RDS text, DAB label)
@@ -406,12 +408,27 @@ impl RadioService {
                 "audioReady": self.dab.audio_ready(),
                 "audioError": self.dab.audio_error(),
                 "scanning": self.scanning,
-                "stations": self.dab.stations(),
+                "stations": stations_json(self.dab.stations()),
                 "current": self.dab.current(),
                 "dynamicLabel": self.dab.dynamic_label(),
+                "slide": self.dab.slide().map(|path| file_url(&path)),
                 "favorites": self.dab.favorites(),
             },
         })
     }
 }
 
+// The station list for the UI: each station with its cached slideshow picture, if it has one
+fn stations_json(stations: &[DabStation]) -> Value {
+    let slides = slide_cache::all();
+    Value::Array(
+        stations
+            .iter()
+            .map(|station| {
+                let mut value = json!(station);
+                value["slide"] = json!(slides.get(&station.id).map(|path| file_url(path)));
+                value
+            })
+            .collect(),
+    )
+}

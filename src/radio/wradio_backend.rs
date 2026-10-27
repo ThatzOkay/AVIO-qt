@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,6 +14,7 @@ use crate::audio::audio_output::AudioOutput;
 use super::Notifier;
 use super::channels::channel_name;
 use super::dab::{DabScanProgress, DabStation};
+use super::slide_cache;
 
 // A full Band III sweep waits on FIC collection per channel, so it takes a while on a weak
 // antenna; this only guards against a scan that never reports finishing.
@@ -49,6 +51,8 @@ pub struct WradioBackend {
     device: Option<DeviceHandle>,
     audio: Option<Arc<tokio::sync::Mutex<AudioOutput>>>,
     dynamic_label: Arc<Mutex<Option<String>>>,
+    // The newest slideshow picture of the tuned station (see slide_cache)
+    slide: Arc<Mutex<Option<PathBuf>>>,
     audio_state: Arc<AudioState>,
     // Why the running tune is still retrying, for the UI
     tune_status: Arc<Mutex<Option<String>>>,
@@ -62,6 +66,7 @@ impl WradioBackend {
             device: None,
             audio: None,
             dynamic_label: Arc::new(Mutex::new(None)),
+            slide: Arc::new(Mutex::new(None)),
             audio_state: Arc::new(AudioState::default()),
             tune_status: Arc::new(Mutex::new(None)),
             tasks: Vec::new(),
@@ -74,6 +79,11 @@ impl WradioBackend {
 
     fn set_label(notify: &Notifier, slot: &Mutex<Option<String>>, label: Option<String>) {
         *slot.lock().unwrap() = label;
+        let _ = notify.send(());
+    }
+
+    fn set_slide(notify: &Notifier, slot: &Mutex<Option<PathBuf>>, slide: Option<PathBuf>) {
+        *slot.lock().unwrap() = slide;
         let _ = notify.send(());
     }
 
@@ -252,6 +262,31 @@ impl WradioBackend {
             }
         }));
 
+        // Slideshow pictures: shown as they arrive, and kept for the next time the station is tuned
+        let mut slide_rx = device.subscribe_slideshow_update();
+        let notify = self.notify.clone();
+        let slide = self.slide.clone();
+        self.tasks.push(tokio::spawn(async move {
+            loop {
+                match slide_rx.recv().await {
+                    Ok(event) => {
+                        let stored = tokio::task::spawn_blocking(move || {
+                            let update = event.update;
+                            slide_cache::store(event.service_id, &update.mime_type, &update.slideshow_data)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(path) = stored {
+                            Self::set_slide(&notify, &slide, Some(path));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+
         // The core refreshes this on every poll; only wake the UI when the bars actually move
         let mut lock_rx = device.subscribe_lock_status();
         let notify = self.notify.clone();
@@ -290,6 +325,7 @@ impl WradioBackend {
         }
         self.audio_state.reset();
         Self::set_label(&self.notify, &self.dynamic_label, None);
+        Self::set_slide(&self.notify, &self.slide, None);
         Ok(())
     }
 
@@ -373,6 +409,7 @@ impl WradioBackend {
             device: self.device()?.clone(),
             audio: self.audio.clone(),
             dynamic_label: self.dynamic_label.clone(),
+            slide: self.slide.clone(),
             audio_state: self.audio_state.clone(),
             status: self.tune_status.clone(),
         })
@@ -389,6 +426,7 @@ impl WradioBackend {
             .map_err(|e| e.to_string())?;
         self.audio_state.reset();
         Self::set_label(&self.notify, &self.dynamic_label, None);
+        Self::set_slide(&self.notify, &self.slide, None);
         Ok(())
     }
 
@@ -408,6 +446,10 @@ impl WradioBackend {
     pub fn dynamic_label(&self) -> Option<String> {
         self.dynamic_label.lock().unwrap().clone()
     }
+
+    pub fn slide(&self) -> Option<PathBuf> {
+        self.slide.lock().unwrap().clone()
+    }
 }
 
 /// One station tune. `run` keeps retrying until the station plays; dropping the future (the user
@@ -417,6 +459,7 @@ pub struct TuneJob {
     device: DeviceHandle,
     audio: Option<Arc<tokio::sync::Mutex<AudioOutput>>>,
     dynamic_label: Arc<Mutex<Option<String>>>,
+    slide: Arc<Mutex<Option<PathBuf>>>,
     audio_state: Arc<AudioState>,
     status: Arc<Mutex<Option<String>>>,
 }
@@ -437,6 +480,8 @@ impl TuneJob {
     pub async fn run(&self, station: &DabStation) -> Result<(), String> {
         self.audio_state.reset();
         WradioBackend::set_label(&self.notify, &self.dynamic_label, None);
+        // The station's last picture until the broadcast sends a new one
+        WradioBackend::set_slide(&self.notify, &self.slide, slide_cache::latest(station.id));
         // The output exits if its pipeline failed; bring it back before new audio arrives
         if let Some(audio) = &self.audio {
             let mut output = audio.lock().await;

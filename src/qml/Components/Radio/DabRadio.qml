@@ -37,6 +37,25 @@ ColumnLayout {
         Layout.minimumHeight: 140
         spacing: 8
 
+        // The station's slideshow picture: the newest broadcast, or the cached one until then
+        Rectangle {
+            Layout.alignment: Qt.AlignHCenter
+            Layout.preferredWidth: 128
+            Layout.preferredHeight: 96
+            visible: slide.status === Image.Ready
+            radius: 12
+            color: Theme.surfaceContainerHighest
+            clip: true
+
+            Image {
+                id: slide
+                anchors.fill: parent
+                source: root.dab.slide ?? ""
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                cache: false
+            }
+        }
         Label {
             Layout.alignment: Qt.AlignHCenter
             text: "DAB RADIO"
@@ -133,9 +152,20 @@ ColumnLayout {
 
                             SettingsIcon {
                                 anchors.centerIn: parent
+                                visible: logo.status !== Image.Ready
                                 source: "../../../assets/icons/mdi/radio.png"
                                 size: 32
                                 color: Theme.onSurface
+                            }
+                            // The station's last slideshow picture, once it has sent one
+                            Image {
+                                id: logo
+                                anchors.fill: parent
+                                anchors.margins: 4
+                                source: cell.modelData.slide ?? ""
+                                fillMode: Image.PreserveAspectFit
+                                asynchronous: true
+                                cache: false
                             }
                         }
                         Label {

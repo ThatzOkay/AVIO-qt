@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +125,12 @@ impl DabBackend {
         }
     }
 
+    fn slide(&self) -> Option<PathBuf> {
+        match self {
+            Self::Wradio(backend) => backend.slide(),
+        }
+    }
+
     fn signal_bars(&self) -> Option<u8> {
         match self {
             Self::Wradio(backend) => backend.signal_bars(),
@@ -208,6 +214,10 @@ impl DabTuner {
 
     pub fn dynamic_label(&self) -> Option<String> {
         self.backend.as_ref().and_then(DabBackend::dynamic_label)
+    }
+
+    pub fn slide(&self) -> Option<PathBuf> {
+        self.backend.as_ref().and_then(DabBackend::slide)
     }
 
     /// Whether decoded audio has started reaching the output since the last tune. `playing` is
