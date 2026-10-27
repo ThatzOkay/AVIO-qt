@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         qml6-module-qtquick qml6-module-qtquick-controls \
         qml6-module-qtquick-layouts qml6-module-qtquick-templates \
         qml6-module-qtquick-window \
-        qml6-module-qtquick-dialogs qml6-module-qt-labs-folderlistmodel \
+        qml6-module-qtquick-dialogs qml6-module-qtquick-effects qml6-module-qt-labs-folderlistmodel \
+        qt6-wayland patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 # Native libs the path crates link against (cpal, gst-video, rtl-sdr, welle-io-sys,
@@ -61,7 +62,17 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     && cargo build --release --locked \
     && cp target/release/avio_qt target/release/gst-host /out/
 
+# The same plus the Qt runtime (scripts/qt/bundle-linux.sh), for the desktop Linux packages, which
+# can't count on the host having the Qt the binary was built against. Not for the Buildroot image
+# (armv7): it has its own Qt.
+FROM build AS bundle
+COPY scripts/qt/bundle-linux.sh /usr/local/bin/bundle-qt
+RUN bundle-qt /out/avio_qt /bundle && cp /out/gst-host /bundle/
+
 # `docker build --target artifact --output out .` writes just the binaries: the app and its
 # gst-host sidecar (the app wants it as gst-host-<arch>-unknown-linux-gnu next to itself).
 FROM scratch AS artifact
 COPY --from=build /out/ /
+
+FROM scratch AS artifact-bundled
+COPY --from=bundle /bundle/ /

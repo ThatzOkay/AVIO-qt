@@ -152,11 +152,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # armv7 runs on the Buildroot image, which brings its own Qt; the desktop packages carry theirs
+          target=artifact-bundled
+          [[ "${{ matrix.arch }}" == "armv7" ]] && target=artifact
           docker buildx build --platform "${{ matrix.platform }}" \
             --build-arg JOBS="$(nproc)" \
             --cache-from "type=gha,scope=${{ matrix.arch }}" \
             --cache-to "type=gha,scope=${{ matrix.arch }},mode=max" \
-            --target artifact --output type=local,dest=out .
+            --target "$target" --output type=local,dest=out .
 
       # The app looks for gst-host-<ARCH>-unknown-linux-gnu next to itself (ARCH is rust's
       # std::env::consts::ARCH, so "arm" on armv7) and for assets/ next to the executable.
@@ -172,6 +175,10 @@ jobs:
           esac
           mkdir -p "$PACKAGE"
           install -m755 out/avio_qt "$PACKAGE/avio_qt"
+          # Qt runtime of the bundled targets (lib/, plugins/, qml/, qt.conf)
+          for d in lib plugins qml qt.conf; do
+            [[ -e "out/$d" ]] && cp -a "out/$d" "$PACKAGE/"
+          done
           install -m755 out/gst-host "$PACKAGE/gst-host-${rust_arch}-unknown-linux-gnu"
           # Everything but the GStreamer bundles of other platforms. armv7 has none, it uses the
           # system GStreamer (see src/audio/gstreamer.rs).
@@ -401,9 +408,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ('${{ matrix.arch }}' -eq 'x64') {
-            $mingwex = ((& x86_64-w64-mingw32-gcc -print-file-name=libmingwex.a) -join '').Trim() -replace '\\', '/'
+            # Quoted: PowerShell splits an unquoted -print-file-name=libmingwex.a at the dot
+            $mingwex = ((& x86_64-w64-mingw32-gcc '-print-file-name=libmingwex.a') -join '').Trim() -replace '\\', '/'
             Write-Host "libmingwex: $mingwex"
-            $env:RUSTFLAGS = "-C link-arg=-Wl,--allow-multiple-definition -C link-arg=$mingwex"
+            Get-Command x86_64-w64-mingw32-gcc | Format-List Source
+            Get-ChildItem -Path D:\a,"$env:ProgramFiles\gstreamer","$env:USERPROFILE\.rustup" -Recurse -Filter libmingwex.a -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+            # -Wl,-t lists every file the linker opens; it is only shown if the link fails
+            $env:RUSTFLAGS = "-C link-arg=-Wl,--allow-multiple-definition -C link-arg=-Wl,-t"
+            if (Test-Path $mingwex) { $env:RUSTFLAGS += " -C link-arg=$mingwex" }
           }
           cargo build --release --locked --workspace --bins
           if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
