@@ -400,8 +400,7 @@ jobs:
       # MinGW's libpthread.a at link time. librtlsdr itself is vendored (crates/rtl-sdr/vendor).
       #
       # The libm symbols (round, fma, cbrt, ...) came up undefined at link time although Qt's MinGW
-      # libmingwex defines them, so another libmingwex is probably found first. Naming the
-      # compiler's own copy at the end of the link line settles that.
+      # libmingwex defines them: see the comment in the step.
       - name: Build [windows]
         if: matrix.os == 'windows'
         shell: pwsh
@@ -411,11 +410,11 @@ jobs:
             # Quoted: PowerShell splits an unquoted -print-file-name=libmingwex.a at the dot
             $mingwex = ((& x86_64-w64-mingw32-gcc '-print-file-name=libmingwex.a') -join '').Trim() -replace '\\', '/'
             Write-Host "libmingwex: $mingwex"
-            Get-Command x86_64-w64-mingw32-gcc | Format-List Source
-            Get-ChildItem -Path D:\a,"$env:ProgramFiles\gstreamer","$env:USERPROFILE\.rustup" -Recurse -Filter libmingwex.a -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
-            # -Wl,-t lists every file the linker opens; it is only shown if the link fails
-            $env:RUSTFLAGS = "-C link-arg=-Wl,--allow-multiple-definition -C link-arg=-Wl,-t"
-            if (Test-Path $mingwex) { $env:RUSTFLAGS += " -C link-arg=$mingwex" }
+            # Only the link failure's -Wl,-t trace shows it: -lmingwex resolves to the copy in
+            # GStreamer's lib dir, which pkg-config puts on the search path ahead of the
+            # compiler's own. Its math functions don't match, so name the compiler's copy at the
+            # end, in a group with msvcrt since libmingwex's own objects need frexp from there.
+            $env:RUSTFLAGS = "-C link-arg=-Wl,--allow-multiple-definition -C link-arg=-Wl,--start-group -C link-arg=$mingwex -C link-arg=-lmsvcrt -C link-arg=-Wl,--end-group"
           }
           cargo build --release --locked --workspace --bins
           if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
