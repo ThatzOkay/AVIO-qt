@@ -22,6 +22,13 @@ use theme::Theme;
 use crate::usb::usb_service::UsbService;
 
 const WORKER_THREADS: usize = 3;
+
+// Debug builds read the QML from the source tree, so scripts/dev.sh can relaunch on an edit.
+// Release builds carry it inside the binary, with the icons the QML refers to as ../../assets/icons
+#[cfg(debug_assertions)]
+const QML_MAIN: &str = concat!("file://", env!("CARGO_MANIFEST_DIR"), "/src/qml/Main.qml");
+#[cfg(not(debug_assertions))]
+const QML_MAIN: &str = "qrc:/qml/Main.qml";
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Default)]
@@ -43,6 +50,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     unsafe { std::env::set_var("QT_QUICK_CONTROLS_STYLE", "Material") };
+
+    #[cfg(not(debug_assertions))]
+    {
+        qtbridge::include_bytes_qml!("qml");
+        qtbridge::include_bytes_qml!("assets/icons");
+    }
 
     // Not #[tokio::main]: Qt's event loop must run on the main thread outside the runtime context
     // Surface RT has 4 cores: one for Qt's UI thread, three for async work
@@ -68,11 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register::<RadioStore>()
         .register::<StatusStore>()
         .register::<UdevStore>()
-        .load_qml_from_file(concat!(
-            "file://",
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/qml/Main.qml"
-        ))
+        .load_qml_from_file(QML_MAIN)
         .run();
 
     // Qt's loop has ended: stop watching USB, tell the Android Auto session to release the phone
