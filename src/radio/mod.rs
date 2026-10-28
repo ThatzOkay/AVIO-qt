@@ -408,7 +408,8 @@ impl RadioService {
                 "audioReady": self.dab.audio_ready(),
                 "audioError": self.dab.audio_error(),
                 "scanning": self.scanning,
-                "stations": stations_json(self.dab.stations()),
+                "stations": self.dab.stations(),
+                "slides": slides_json(),
                 "current": self.dab.current(),
                 "dynamicLabel": self.dab.dynamic_label(),
                 "slide": self.dab.slide().map(|path| file_url(&path)),
@@ -418,17 +419,13 @@ impl RadioService {
     }
 }
 
-// The station list for the UI: each station with its cached slideshow picture, if it has one
-fn stations_json(stations: &[DabStation]) -> Value {
-    let slides = slide_cache::all();
-    Value::Array(
-        stations
-            .iter()
-            .map(|station| {
-                let mut value = json!(station);
-                value["slide"] = json!(slides.get(&station.id).map(|path| file_url(path)));
-                value
-            })
+// Each station's cached slideshow picture by service id, apart from the station list: the list has to
+// stay identical between updates, or the UI's grid resets its scroll position
+fn slides_json() -> Value {
+    Value::Object(
+        slide_cache::all()
+            .into_iter()
+            .map(|(id, path)| (id.to_string(), json!(file_url(&path))))
             .collect(),
     )
 }

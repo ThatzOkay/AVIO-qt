@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,40 @@ pub struct DabStation {
     pub label: String,
     pub channel: u32,
     pub frequency: u32,
+    /// The same station on its other frequencies, weaker ones after stronger: what a tune falls back
+    /// to when this one doesn't lock. Empty for a station found on one frequency only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<DabStation>,
+}
+
+fn merge_key(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Folds stations that share a label across frequencies into one: the strongest frequency (by the
+/// scan's `signal` bars per frequency, scan order on a tie) with the others as alternatives.
+pub fn merge_duplicates(stations: Vec<DabStation>, signal: &HashMap<u32, u8>) -> Vec<DabStation> {
+    let mut groups: Vec<Vec<DabStation>> = Vec::new();
+    for station in stations {
+        let key = merge_key(&station.label);
+        // The same label twice in one ensemble is two services, not one on two frequencies
+        let group = groups
+            .iter_mut()
+            .find(|g| merge_key(&g[0].label) == key && g.iter().all(|s| s.frequency != station.frequency));
+        match group {
+            Some(group) => group.push(station),
+            None => groups.push(vec![station]),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|mut group| {
+            group.sort_by_key(|s| std::cmp::Reverse(signal.get(&s.frequency).copied().unwrap_or(0)));
+            let mut best = group.remove(0);
+            best.alternatives = group;
+            best
+        })
+        .collect()
 }
 
 /// What a scan is doing right now. A channel is reported when the scan starts looking at it
@@ -379,7 +414,7 @@ mod tests {
     use super::*;
 
     fn station(id: u32, label: &str, frequency: u32) -> DabStation {
-        DabStation { id, label: label.to_string(), channel: 0, frequency }
+        DabStation { id, label: label.to_string(), channel: 0, frequency, alternatives: Vec::new() }
     }
 
     fn tuner(stations: Vec<DabStation>, favorites: Vec<Option<DabStation>>) -> DabTuner {
@@ -418,5 +453,27 @@ mod tests {
         assert!(imported.import_list(&file).await.is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn merges_a_station_on_several_frequencies_into_its_strongest() {
+        let weak = station(1, "SLAM!", 220_352);
+        let strong = station(2, " slam! ", 225_648);
+        let other = station(3, "JOE", 220_352);
+        let signal = HashMap::from([(220_352, 2), (225_648, 5)]);
+
+        let merged = merge_duplicates(vec![weak.clone(), other.clone(), strong.clone()], &signal);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].frequency, 225_648);
+        assert_eq!(merged[0].alternatives, vec![weak]);
+        assert_eq!(merged[1], other);
+    }
+
+    #[test]
+    fn keeps_same_label_services_of_one_ensemble_apart() {
+        let a = station(1, "Radio", 220_352);
+        let b = station(2, "Radio", 220_352);
+        assert_eq!(merge_duplicates(vec![a, b], &HashMap::new()).len(), 2);
     }
 }

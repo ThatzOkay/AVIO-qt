@@ -18,7 +18,12 @@ ColumnLayout {
     readonly property bool buffering: playing && !(dab.audioReady ?? false) && !(dab.audioError ?? "")
     readonly property string audioError: dab.audioError ?? ""
     readonly property var signalBars: dab.signalBars ?? null
-    readonly property var stations: dab.stations ?? []
+    // Replaced only when its content changes: handing the grid a new but equal array resets its scroll
+    property var stations: []
+    readonly property var slides: dab.slides ?? ({})
+    readonly property string stationsKey: JSON.stringify(dab.stations ?? [])
+    onStationsKeyChanged: stations = dab.stations ?? []
+    Component.onCompleted: stations = dab.stations ?? []
     readonly property var current: dab.current ?? null
     readonly property var favorites: dab.favorites ?? []
     readonly property string error: (RadioStore.state?.error ?? "") || audioError
@@ -37,16 +42,23 @@ ColumnLayout {
         Layout.minimumHeight: 140
         spacing: 8
 
-        // The station's slideshow picture: the newest broadcast, or the cached one until then
+        // The station's slideshow picture: the newest broadcast, or the cached one until then. Always
+        // there, with the radio icon until a picture exists, so the layout doesn't shift when one arrives.
         Rectangle {
             Layout.alignment: Qt.AlignHCenter
             Layout.preferredWidth: 128
             Layout.preferredHeight: 96
-            visible: slide.status === Image.Ready
             radius: 12
             color: Theme.surfaceContainerHighest
             clip: true
 
+            SettingsIcon {
+                anchors.centerIn: parent
+                visible: slide.status !== Image.Ready
+                source: "../../../assets/icons/mdi/radio.png"
+                size: 40
+                color: Theme.onSurface
+            }
             Image {
                 id: slide
                 anchors.fill: parent
@@ -162,7 +174,7 @@ ColumnLayout {
                                 id: logo
                                 anchors.fill: parent
                                 anchors.margins: 4
-                                source: cell.modelData.slide ?? ""
+                                source: root.slides[String(cell.modelData.id)] ?? ""
                                 fillMode: Image.PreserveAspectFit
                                 asynchronous: true
                                 cache: false

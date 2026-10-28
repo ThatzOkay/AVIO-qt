@@ -28,6 +28,9 @@ pub struct AudioOutput {
     stop_grace_ms: u64,
     process: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
+    // A started, idle copy of the pipeline that `flush` swaps in. Only kept when `keep_spare` is set.
+    spare: Option<(tokio::process::Child, Option<tokio::process::ChildStdin>)>,
+    keep_spare: bool,
     sample_rate: i32,
     channels: i32,
     mode: AudioOutputMode,
@@ -53,6 +56,8 @@ impl AudioOutput {
             device: opts.device,
             process: None,
             stdin: None,
+            spare: None,
+            keep_spare: false,
             bytes_written: 0,
             queue: vec![],
             writing: false,
@@ -71,6 +76,7 @@ impl AudioOutput {
             device,
         });
         output.input = AudioInput::Adts;
+        output.keep_spare = true;
         output
     }
 
@@ -82,19 +88,54 @@ impl AudioOutput {
     pub async fn start(&mut self) {
         self.kill_immediate().await;
 
-        let os = std::env::consts::OS;
-        if os != "macos" && os != "linux" && os != "windows" {
-            eprintln!("[AudioOutput] Unsupported platform");
-            return;
-        }
-
-        let (cmd, env) = launch_command("gst-launch-1.0");
-        let args = self.build_args();
-
         self.bytes_written = 0;
         self.queue.clear();
         self.writing = false;
         self.write_seq = 0;
+
+        if let Some((child, stdin)) = self.spawn_pipeline() {
+            self.process = Some(child);
+            self.stdin = stdin;
+        }
+        if self.keep_spare && self.spare.is_none() {
+            self.spare = self.spawn_pipeline();
+        }
+    }
+
+    /// Drops everything the pipeline has buffered (its queues and the sink's buffer), so the next
+    /// audio written is heard right away. gst-launch can't be told to flush, so this swaps in the
+    /// spare pipeline, which has long finished starting up, and kills the old one.
+    pub async fn flush(&mut self) {
+        let spare = self.spare.take();
+        self.kill_immediate().await;
+        match spare {
+            Some((child, stdin)) => {
+                self.process = Some(child);
+                self.stdin = stdin;
+            }
+            None => {
+                if let Some((child, stdin)) = self.spawn_pipeline() {
+                    self.process = Some(child);
+                    self.stdin = stdin;
+                }
+            }
+        }
+        if self.keep_spare {
+            self.spare = self.spawn_pipeline();
+        }
+    }
+
+    // Starts a gst-launch process for this output's pipeline and logs its stderr. The process is
+    // killed when dropped.
+    fn spawn_pipeline(&self) -> Option<(tokio::process::Child, Option<tokio::process::ChildStdin>)> {
+        let os = std::env::consts::OS;
+        if os != "macos" && os != "linux" && os != "windows" {
+            eprintln!("[AudioOutput] Unsupported platform");
+            return None;
+        }
+
+        let (cmd, env) = launch_command("gst-launch-1.0");
+        let args = self.build_args();
 
         let mut command = tokio::process::Command::new(&cmd);
         command
@@ -109,17 +150,12 @@ impl AudioOutput {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[AudioOutput] Failed to spawn: {e}");
-                return;
+                return None;
             }
         };
 
         let stdin = child.stdin.take();
-        let stderr = child.stderr.take();
-
-        self.process = Some(child);
-        self.stdin = stdin;
-
-        if let Some(stderr) = stderr {
+        if let Some(stderr) = child.stderr.take() {
             crate::runtime::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -127,6 +163,7 @@ impl AudioOutput {
                 }
             });
         }
+        Some((child, stdin))
     }
 
     pub async fn write(&mut self, chunk: Vec<i16>) {
@@ -169,6 +206,8 @@ impl AudioOutput {
             return;
         }
 
+        // Dropping the spare kills it
+        self.spare = None;
         let mut proc = self.process.take().unwrap();
         self.end_stdin().await;
 

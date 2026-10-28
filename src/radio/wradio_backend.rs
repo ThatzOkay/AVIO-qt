@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use wradio_c100_core::Tuner;
 use crate::audio::audio_output::AudioOutput;
 use super::Notifier;
 use super::channels::channel_name;
-use super::dab::{DabScanProgress, DabStation};
+use super::dab::{DabScanProgress, DabStation, merge_duplicates};
 use super::slide_cache;
 
 // A full Band III sweep waits on FIC collection per channel, so it takes a while on a weak
@@ -23,6 +23,8 @@ const SCAN_START_TIMEOUT: Duration = Duration::from_secs(5);
 // After a tune the ensemble starts empty and fills in as the FIC is polled, which takes a few
 // seconds; a service can only be started once it's listed.
 const SERVICE_LIST_TIMEOUT: Duration = Duration::from_secs(15);
+// Failed tunes on one frequency before a station with alternatives moves on to the next
+const TRIES_PER_FREQUENCY: u32 = 2;
 const AUDIO_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Whether decoded audio is actually reaching the output, as opposed to a tune having been asked for.
@@ -34,6 +36,26 @@ struct AudioState {
     error: Mutex<Option<String>>,
     /// When the current station started, until its first audio frame shows up (for the log)
     waiting_since: Mutex<Option<std::time::Instant>>,
+    /// Tunes in progress. While there is one, frames still arriving from the previous station are
+    /// dropped instead of being played over the new one.
+    tuning: AtomicUsize,
+}
+
+/// Holds `AudioState::tuning` up for as long as a tune runs, however it ends (done, failed or
+/// cancelled by dropping it).
+struct TuneMute(Arc<AudioState>);
+
+impl TuneMute {
+    fn new(state: &Arc<AudioState>) -> Self {
+        state.tuning.fetch_add(1, Ordering::SeqCst);
+        Self(state.clone())
+    }
+}
+
+impl Drop for TuneMute {
+    fn drop(&mut self) {
+        self.0.tuning.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl AudioState {
@@ -189,6 +211,10 @@ impl WradioBackend {
             frames += 1;
             bytes += adts_buf.len();
 
+            if state.tuning.load(Ordering::SeqCst) > 0 {
+                continue;
+            }
+
             let alive = {
                 let mut output = audio.lock().await;
                 output.write_bytes(adts_buf.clone()).await;
@@ -219,6 +245,7 @@ impl WradioBackend {
                         label: s.label.trim().to_string(),
                         channel,
                         frequency: ensemble.frequency_khz,
+                        alternatives: Vec::new(),
                     })
             })
             .collect()
@@ -342,6 +369,8 @@ impl WradioBackend {
         // An ensemble is reported repeatedly as its FIC fills in; the last one per frequency is
         // the most complete.
         let mut ensembles: HashMap<u32, EnsembleInfo> = HashMap::new();
+        // Antenna level per frequency, to pick the best one of a station that is on several
+        let mut signal: HashMap<u32, u8> = HashMap::new();
         let mut started = snapshot_rx.borrow().is_scanning;
         let start_deadline = tokio::time::Instant::now() + SCAN_START_TIMEOUT;
         let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
@@ -356,7 +385,11 @@ impl WradioBackend {
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 update = progress_rx.recv() => match update {
-                    Ok(p) => progress(DabScanProgress {
+                    Ok(p) => {
+                        if let Some(bars) = p.signal_bars {
+                            signal.insert(p.frequency_khz, bars);
+                        }
+                        progress(DabScanProgress {
                         channel_index: p.channel_index,
                         channel_count: p.channel_count,
                         frequency_khz: p.frequency_khz,
@@ -365,7 +398,8 @@ impl WradioBackend {
                         failed: p.failed,
                         ensemble: p.ensemble_label,
                         service_count: p.service_count,
-                    }),
+                    })
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
@@ -397,7 +431,7 @@ impl WradioBackend {
 
         let mut stations = Self::stations_from(ensembles);
         stations.retain(|s| !s.label.is_empty());
-        Ok(stations)
+        Ok(merge_duplicates(stations, &signal))
     }
 
     /// Everything a tune needs, owned, so it can run while the backend itself stays free (and be
@@ -482,20 +516,24 @@ impl TuneJob {
         WradioBackend::set_label(&self.notify, &self.dynamic_label, None);
         // The station's last picture until the broadcast sends a new one
         WradioBackend::set_slide(&self.notify, &self.slide, slide_cache::latest(station.id));
-        // The output exits if its pipeline failed; bring it back before new audio arrives
+        // The previous station's audio still sits in the output's buffers: flush them (which also
+        // brings the output back if its pipeline had failed) and drop frames until this tune is done
+        let _mute = TuneMute::new(&self.audio_state);
         if let Some(audio) = &self.audio {
-            let mut output = audio.lock().await;
-            if !output.is_running() {
-                output.start().await;
-            }
+            audio.lock().await.flush().await;
         }
 
+        // The station's frequencies, best first: a frequency that won't lock hands over to the next
+        let candidates: Vec<&DabStation> = std::iter::once(station).chain(&station.alternatives).collect();
+        let mut candidate = 0;
+        let mut tries = 0u32;
         let started = std::time::Instant::now();
         let mut attempt = 0u32;
         let mut force_retune = false;
         loop {
             attempt += 1;
-            match self.attempt(station, force_retune, started).await {
+            tries += 1;
+            match self.attempt(candidates[candidate], force_retune, started).await {
                 Ok(()) => {
                     self.set_status(None);
                     *self.audio_state.waiting_since.lock().unwrap() = Some(std::time::Instant::now());
@@ -504,6 +542,11 @@ impl TuneJob {
                 Err(Attempt::Retry(why)) => {
                     eprintln!("[DAB] {why} (attempt {attempt}), retrying");
                     self.set_status(Some(format!("{why}, retrying ({attempt})")));
+                    if tries >= TRIES_PER_FREQUENCY && candidates.len() > 1 {
+                        candidate = (candidate + 1) % candidates.len();
+                        tries = 0;
+                        eprintln!("[DAB] trying {} on {} kHz instead", station.label, candidates[candidate].frequency);
+                    }
                     // A station list that never arrived needs a fresh tune, not the same one
                     force_retune = true;
                     tokio::time::sleep(Duration::from_millis(500)).await;

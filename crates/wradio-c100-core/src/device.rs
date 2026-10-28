@@ -175,6 +175,9 @@ pub struct ScanProgress {
     /// scan consumer never sees a bogus unresolved-ensemble entry either.
     pub ensemble_label: Option<String>,
     pub service_count: usize,
+    /// Antenna level (0..=6) read once the channel's ensemble was collected, for telling apart the
+    /// frequencies one service is broadcast on. `None` until then, or when the tuner can't say.
+    pub signal_bars: Option<u8>,
 }
 
 /// One Dynamic Label update, tagged with which service it came from (a
@@ -564,6 +567,7 @@ impl TaskState {
                 failed: false,
                 ensemble_label: None,
                 service_count: 0,
+                signal_bars: None,
             });
 
             let locked = self
@@ -579,6 +583,7 @@ impl TaskState {
                     failed: true,
                     ensemble_label: None,
                     service_count: 0,
+                    signal_bars: None,
                 });
                 return Ok(());
             }
@@ -611,6 +616,7 @@ impl TaskState {
                 }
             }
 
+            let signal_bars = self.tuner.antenna_level().await.ok().flatten();
             let ensemble_id_known = ensemble.ensemble_id() != 0xFFFF;
             let service_count = ensemble.services().count();
             let _ = out.scan_progress.send(ScanProgress {
@@ -621,6 +627,7 @@ impl TaskState {
                 failed: false,
                 ensemble_label: ensemble_id_known.then(|| ensemble.ensemble_label().to_string()),
                 service_count: if ensemble_id_known { service_count } else { 0 },
+                signal_bars,
             });
             if ensemble_id_known {
                 let _ = out.ensemble_update.send(ensemble_info(&ensemble));
