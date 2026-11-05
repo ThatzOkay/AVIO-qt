@@ -1,0 +1,61 @@
+# musl (Alpine) build for Linux targets whose userland is musl rather than glibc. A glibc
+# binary from ./Dockerfile asks for /lib/ld-linux-*.so and dies with "not found" there, so
+# this links against Alpine's own Qt / GStreamer / ALSA / PulseAudio instead.
+#
+# Pass `--platform linux/arm/v7`, linux/arm64/v8 or linux/amd64 (build-musl.sh does).
+# A foreign platform runs under QEMU user emulation (needs binfmt: e.g.
+# `docker run --privileged --rm tonistiigi/binfmt --install arm`).
+#
+# The result is dynamically linked, so the target needs the matching runtime packages
+# (see the `artifact` comment below).
+FROM alpine:edge AS build
+
+ARG JOBS=1
+ENV QMAKE=/usr/lib/qt6/bin/qmake6 \
+    CARGO_BUILD_JOBS=${JOBS} \
+    # musl targets default to a static C runtime; Qt and GStreamer are shared libraries
+    RUSTFLAGS="-C target-feature=-crt-static"
+
+RUN apk add --no-cache \
+        build-base pkgconf perl curl ca-certificates linux-headers \
+        rust cargo \
+        qt6-qtbase-dev qt6-qtbase-private-dev \
+        qt6-qtdeclarative-dev qt6-qtdeclarative-private-dev \
+        qt6-qtwayland-dev \
+        alsa-lib-dev pulseaudio-dev \
+        gstreamer-dev gst-plugins-base-dev \
+        rtl-sdr-dev fftw-dev bzip2-dev \
+        protobuf-dev protoc
+
+# qt-build-utils (qtbridge's build script) runs libexec/qtpaths; make sure it resolves
+# whichever way Alpine lays qtpaths out.
+RUN mkdir -p /usr/lib/qt6/libexec \
+    && ( [ -e /usr/lib/qt6/libexec/qtpaths ] \
+         || ln -sf "$(command -v qtpaths6 || echo /usr/lib/qt6/bin/qtpaths6)" /usr/lib/qt6/libexec/qtpaths )
+
+WORKDIR /app
+RUN mkdir /out
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Dependencies first, against a stub main.rs, so this expensive layer is cached until
+# Cargo.toml, Cargo.lock or crates/ change (same scheme as ./Dockerfile).
+RUN mkdir src && echo 'fn main() {}' > src/main.rs
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    cargo build --release --locked \
+    && cargo build --release --locked -p gst-video --bin gst-host
+
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    touch src/main.rs \
+    && cargo build --release --locked \
+    && cp target/release/avio_qt target/release/gst-host /out/
+
+# `docker build -f Dockerfile.musl --target artifact --output out .` writes just the two
+# binaries; the app falls back to the unsuffixed gst-host sitting next to it.
+#
+# Runtime packages the target needs (Alpine names):
+#   qt6-qtbase qt6-qtdeclarative qt6-qtwayland gstreamer gst-plugins-base alsa-lib
+#   pulseaudio-libs rtl-sdr fftw-single-libs (or fftw-libs) libbz2
+FROM scratch AS artifact
+COPY --from=build /out/ /

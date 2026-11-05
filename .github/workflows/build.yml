@@ -22,6 +22,10 @@ on:
         description: 'Build Linux armv7 (Surface RT / Buildroot, QEMU, slow)'
         type: boolean
         default: true
+      linux_armv7_musl:
+        description: 'Build Linux armv7 musl (Alpine / musl, Dockerfile.musl, QEMU, slow)'
+        type: boolean
+        default: true
       macos_arm64:
         description: 'Build macOS arm64'
         type: boolean
@@ -59,6 +63,7 @@ jobs:
           IN_LINUX_X64: ${{ inputs.linux_x64 }}
           IN_LINUX_ARM64: ${{ inputs.linux_arm64 }}
           IN_LINUX_ARMV7: ${{ inputs.linux_armv7 }}
+          IN_LINUX_ARMV7_MUSL: ${{ inputs.linux_armv7_musl }}
           IN_MACOS_ARM64: ${{ inputs.macos_arm64 }}
           IN_MACOS_X64: ${{ inputs.macos_x64 }}
           IN_WINDOWS_X64: ${{ inputs.windows_x64 }}
@@ -66,12 +71,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Every lane is native to its runner, except linux-armv7 which runs the Dockerfile
+          # Every lane is native to its runner, except linux-armv7 and linux-armv7-musl which run
+          # the Dockerfile / Dockerfile.musl
           # under QEMU. Fields: os, runner, arch, docker platform (linux only)
           lanes=(
             'linux|ubuntu-latest|x64|linux/amd64'
             'linux|ubuntu-24.04-arm|arm64|linux/arm64/v8'
             'linux|ubuntu-latest|armv7|linux/arm/v7'
+            'linux|ubuntu-latest|armv7-musl|linux/arm/v7'
             'macos|macos-latest|arm64|'
             'macos|macos-15-intel|x64|'
             'windows|windows-latest|x64|'
@@ -87,6 +94,7 @@ jobs:
               linux-x64) [[ "$IN_LINUX_X64" == "true" ]] ;;
               linux-arm64) [[ "$IN_LINUX_ARM64" == "true" ]] ;;
               linux-armv7) [[ "$IN_LINUX_ARMV7" == "true" ]] ;;
+              linux-armv7-musl) [[ "$IN_LINUX_ARMV7_MUSL" == "true" ]] ;;
               macos-arm64) [[ "$IN_MACOS_ARM64" == "true" ]] ;;
               macos-x64) [[ "$IN_MACOS_X64" == "true" ]] ;;
               windows-x64) [[ "$IN_WINDOWS_X64" == "true" ]] ;;
@@ -138,7 +146,7 @@ jobs:
       # Linux (Dockerfile: Debian forky, so the result matches the Buildroot/Pi targets)
       # ----------------------------
       - name: Set up QEMU [linux-armv7]
-        if: matrix.os == 'linux' && matrix.arch == 'armv7'
+        if: matrix.os == 'linux' && startsWith(matrix.arch, 'armv7')
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm
@@ -154,8 +162,14 @@ jobs:
           set -euo pipefail
           # armv7 runs on the Buildroot image, which brings its own Qt; the desktop packages carry theirs
           target=artifact-bundled
+          dockerfile=Dockerfile
           [[ "${{ matrix.arch }}" == "armv7" ]] && target=artifact
-          docker buildx build --platform "${{ matrix.platform }}" \
+          # musl targets (e.g. an Alpine userland) can't run the glibc build
+          if [[ "${{ matrix.arch }}" == *-musl ]]; then
+            dockerfile=Dockerfile.musl
+            target=artifact
+          fi
+          docker buildx build --platform "${{ matrix.platform }}" -f "$dockerfile" \
             --build-arg JOBS="$(nproc)" \
             --cache-from "type=gha,scope=${{ matrix.arch }}" \
             --cache-to "type=gha,scope=${{ matrix.arch }},mode=max" \
@@ -171,7 +185,7 @@ jobs:
           case "${{ matrix.arch }}" in
             x64) rust_arch=x86_64 ;;
             arm64) rust_arch=aarch64 ;;
-            armv7) rust_arch=arm ;;
+            armv7|armv7-musl) rust_arch=arm ;;
           esac
           mkdir -p "$PACKAGE"
           install -m755 out/avio_qt "$PACKAGE/avio_qt"
@@ -179,7 +193,12 @@ jobs:
           for d in lib plugins qml qt.conf; do
             [[ -e "out/$d" ]] && cp -a "out/$d" "$PACKAGE/"
           done
-          install -m755 out/gst-host "$PACKAGE/gst-host-${rust_arch}-unknown-linux-gnu"
+          if [[ "${{ matrix.arch }}" == *-musl ]]; then
+            # No -gnu triple for a musl build: the app falls back to an unsuffixed gst-host
+            install -m755 out/gst-host "$PACKAGE/gst-host"
+          else
+            install -m755 out/gst-host "$PACKAGE/gst-host-${rust_arch}-unknown-linux-gnu"
+          fi
           # Everything but the GStreamer bundles of other platforms. armv7 has none, it uses the
           # system GStreamer (see src/audio/gstreamer.rs).
           mkdir -p "$PACKAGE/assets"
