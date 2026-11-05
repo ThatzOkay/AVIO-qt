@@ -2,7 +2,8 @@
 # binary from ./Dockerfile asks for /lib/ld-linux-*.so and dies with "not found" there, so
 # this links against Alpine's own Qt / GStreamer / ALSA / PulseAudio instead.
 #
-# Pass `--platform linux/arm/v7`, linux/arm64/v8 or linux/amd64 (build-musl.sh does). A foreign platform runs under QEMU user emulation (needs binfmt: e.g.
+# Pass `--platform linux/arm/v7`, linux/arm64/v8 or linux/amd64 (build-musl.sh does).
+# A foreign platform runs under QEMU user emulation (needs binfmt: e.g.
 # `docker run --privileged --rm tonistiigi/binfmt --install arm`).
 #
 # The result is dynamically linked, so the target needs the matching runtime packages
