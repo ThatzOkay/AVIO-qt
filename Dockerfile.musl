@@ -1,10 +1,8 @@
-# musl (Alpine) build for Linux targets whose userland is musl rather than glibc, e.g. the
-# Surface RT image ("Nura edge", Alpine-based). A glibc binary from ./Dockerfile asks for
-# /lib/ld-linux-*.so and dies with "not found" there, so this links against Alpine's own
-# Qt / GStreamer / ALSA / PulseAudio instead.
+# musl (Alpine) build for Linux targets whose userland is musl rather than glibc. A glibc
+# binary from ./Dockerfile asks for /lib/ld-linux-*.so and dies with "not found" there, so
+# this links against Alpine's own Qt / GStreamer / ALSA / PulseAudio instead.
 #
-# Pass `--platform linux/arm/v7` for the Surface (build-musl.sh does), or linux/arm64/v8 or
-# linux/amd64. A foreign platform runs under QEMU user emulation (needs binfmt: e.g.
+# Pass `--platform linux/arm/v7`, linux/arm64/v8 or linux/amd64 (build-musl.sh does). A foreign platform runs under QEMU user emulation (needs binfmt: e.g.
 # `docker run --privileged --rm tonistiigi/binfmt --install arm`).
 #
 # The result is dynamically linked, so the target needs the matching runtime packages

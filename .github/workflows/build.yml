@@ -23,7 +23,7 @@ on:
         type: boolean
         default: true
       linux_armv7_musl:
-        description: 'Build Linux armv7 musl (Surface RT Alpine image, Dockerfile.musl, QEMU, slow)'
+        description: 'Build Linux armv7 musl (Alpine / musl, Dockerfile.musl, QEMU, slow)'
         type: boolean
         default: true
       macos_arm64:
@@ -164,7 +164,7 @@ jobs:
           target=artifact-bundled
           dockerfile=Dockerfile
           [[ "${{ matrix.arch }}" == "armv7" ]] && target=artifact
-          # musl targets (Alpine userland, e.g. the Surface RT image) can't run the glibc build
+          # musl targets (e.g. an Alpine userland) can't run the glibc build
           if [[ "${{ matrix.arch }}" == *-musl ]]; then
             dockerfile=Dockerfile.musl
             target=artifact

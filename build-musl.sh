@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the app against musl (Alpine) into ./out_musl_<arch>/ (avio_qt + gst-host).
-# Usage: ./build-musl.sh [armv7|arm64|x86_64]   (default: armv7, the Surface RT)
+# Usage: ./build-musl.sh [armv7|arm64|x86_64]   (default: armv7)
 set -euo pipefail
 cd "$(dirname "$0")"
 
