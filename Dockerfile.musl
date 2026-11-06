@@ -24,7 +24,7 @@ RUN apk add --no-cache \
         qt6-qtwayland-dev \
         alsa-lib-dev pulseaudio-dev \
         gstreamer-dev gst-plugins-base-dev \
-        rtl-sdr-dev fftw-dev bzip2-dev \
+        librtlsdr-dev fftw-dev bzip2-dev \
         protobuf-dev protoc
 
 # qt-build-utils (qtbridge's build script) runs libexec/qtpaths; make sure it resolves
