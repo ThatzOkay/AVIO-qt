@@ -11,7 +11,11 @@
 #include <initializer_list>
 #include <string>
 #ifdef __linux__
+// execinfo.h (backtrace) is glibc-only; musl has no such header.
+#ifdef __GLIBC__
+#define AVIO_HAVE_BACKTRACE 1
 #include <execinfo.h>
+#endif
 #include <fcntl.h>
 #include <glib-unix.h>
 #include <signal.h>
@@ -551,6 +555,7 @@ static gboolean avio_host_readable(gint fd, GIOCondition cond, gpointer data) {
 static char g_crash_log_path[1024] = {0};
 
 static void avio_host_crash(int sig) {
+#ifdef AVIO_HAVE_BACKTRACE
   void* frames[64];
   int n = backtrace(frames, 64);
   const char hdr[] = "\n=== gst-host CRASH backtrace ===\n";
@@ -564,6 +569,10 @@ static void avio_host_crash(int sig) {
       close(cf);
     }
   }
+#else
+  const char msg[] = "\n=== gst-host CRASH (no backtrace on this libc) ===\n";
+  (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
   signal(sig, SIG_DFL);
   raise(sig);
 }
