@@ -53,3 +53,8 @@ windows = { version = "0.62.0", features = [
 ] }
 # Must be the version `windows` itself uses: the `interface` macro expands to `windows_core::` paths
 windows-core = "0.62"
+
+# alsa 0.9.1 builds `timespec` with a struct literal, which fails on 32-bit musl where libc
+# adds a private `__pad0` field. crates/alsa is 0.9.1 with those literals zero-initialised.
+[patch.crates-io]
+alsa = { path = "crates/alsa" }
